@@ -916,6 +916,20 @@ export default function Admin() {
                 </div>
                 <div className="space-y-4">
                   <div>
+                    <label className="text-[10px] font-black uppercase tracking-[0.2em] text-black/40 block mb-2">Customer Support WhatsApp Number</label>
+                    {settingsEditing ? (
+                      <input value={settingsDraft.support_whatsapp || ''}
+                        onChange={e => setSettingsDraft(d => ({ ...d, support_whatsapp: e.target.value }))}
+                        placeholder="e.g. 0244123456"
+                        className="w-full border border-black/10 rounded-xl px-4 py-3 text-sm outline-none focus:border-indigo-400" />
+                    ) : (
+                      <p className="text-sm font-semibold py-3 px-4 bg-[#fafafa] rounded-xl border border-black/[0.06]">
+                        {settings.support_whatsapp || <span className="text-black/30">Not set</span>}
+                      </p>
+                    )}
+                    <p className="text-[10px] text-black/30 mt-1">This number appears as a \"Chat with Support\" button on the customer-facing website.</p>
+                  </div>
+                  <div>
                     <label className="text-[10px] font-black uppercase tracking-[0.2em] text-black/40 block mb-2">Admin WhatsApp Number</label>
                     {settingsEditing ? (
                       <input value={settingsDraft.admin_whatsapp || ''}
