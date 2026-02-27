@@ -1,27 +1,22 @@
 import db from '../../lib/db';
-import { getPrices } from '../../lib/settings';
+import { getPrices, getSetting } from '../../lib/settings';
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).end();
 
   try {
-    const results = await db.query(`
-      SELECT type, COUNT(*) as count
-      FROM vouchers
-      WHERE status = 'available'
-      GROUP BY type
-    `);
+    const [stockRes, prices, supportWhatsapp] = await Promise.all([
+      db.query(`SELECT type, COUNT(*) as count FROM vouchers WHERE status = 'available' GROUP BY type`),
+      getPrices(),
+      getSetting('support_whatsapp', ''),
+    ]);
 
-    const stockMap = { WASSCE: 0, BECE: 0, CSSPS: 0 };
-    results.rows.forEach(row => {
-      stockMap[row.type] = parseInt(row.count);
-    });
+    const stock = { WASSCE: 0, BECE: 0, CSSPS: 0 };
+    stockRes.rows.forEach(row => { stock[row.type] = parseInt(row.count); });
 
-    // Get current prices from settings
-    const prices = await getPrices();
-
-    res.status(200).json({ stock: stockMap, prices });
+    res.status(200).json({ stock, prices, supportWhatsapp });
   } catch (error) {
+    console.error('public-stock error:', error.message);
     res.status(500).json({ error: 'Stock check failed' });
   }
 }
