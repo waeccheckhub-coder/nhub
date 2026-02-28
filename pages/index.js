@@ -53,11 +53,7 @@ export default function Home() {
       toast.dismiss(t);
 
       if (res.data.paymentUrl) {
-        // Store order info for after redirect
-        localStorage.setItem('pendingOrder', JSON.stringify({
-          reference: res.data.reference, quantity: qty, type: voucherType, phone, name, isPreorder
-        }));
-        // Redirect to Moolre payment page
+        // Redirect to Moolre — order details are stored in DB, no localStorage needed
         window.location.href = res.data.paymentUrl;
       } else {
         toast.error('Could not initialize payment. Please try again.');
