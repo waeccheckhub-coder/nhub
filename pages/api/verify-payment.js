@@ -1,9 +1,10 @@
+// POST /api/verify-payment
+// Called from /thank-you page after Moolre redirects back.
+// Only needs { reference } from the frontend — all order details are read from DB.
+
 import pool from '../../lib/db';
 import { sendAdminAlert, checkAndAlertStock } from '../../lib/alerts';
 
-/**
- * Sends the actual SMS via Arkesel
- */
 async function sendVoucherSMS(phone, vouchers, voucherType) {
   const lines = vouchers.map((v, i) => `${i + 1}. Serial: ${v.serial} PIN: ${v.pin}`);
   const message =
@@ -13,19 +14,15 @@ async function sendVoucherSMS(phone, vouchers, voucherType) {
   try {
     await fetch('https://sms.arkesel.com/api/v2/sms/send', {
       method: 'POST',
-      headers: { 
-        'api-key': process.env.ARKESEL_API_KEY, 
-        'Content-Type': 'application/json' 
-      },
+      headers: { 'api-key': process.env.ARKESEL_API_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify({ sender: 'WAEC-GH', message, recipients: [phone] }),
     });
   } catch (err) {
-    console.error('SMS Delivery Error:', err);
+    console.error('SMS delivery error:', err);
   }
 }
 
 export default async function handler(req, res) {
-  // 405 FIX: Explicitly handle allowed methods
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
@@ -35,8 +32,8 @@ export default async function handler(req, res) {
   const { reference } = req.body;
   if (!reference) return res.status(400).json({ error: 'Missing reference' });
 
-  // 1. Verify Status with Moolre
-  let moolreData;
+  // 1. Verify payment status with Moolre
+  let txstatus;
   try {
     const statusRes = await fetch('https://api.moolre.com/open/transact/status', {
       method: 'POST',
@@ -47,109 +44,118 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         type: 1,
-        idtype: 1, 
+        idtype: 1,
         id: reference,
         accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
       }),
     });
 
     const result = await statusRes.json();
-    moolreData = result?.data;
+    txstatus = result?.data?.txstatus;
 
-    if (!moolreData || moolreData.txstatus === 2) {
+    if (!result?.data || txstatus === 2) {
       return res.status(402).json({ error: 'Payment failed or was rejected.' });
     }
-    if (moolreData.txstatus !== 1) {
+    if (txstatus !== 1) {
       return res.status(202).json({ status: 'pending', message: 'Processing payment...' });
     }
   } catch (err) {
-    console.error('Moolre Fetch Error:', err);
+    console.error('Moolre fetch error:', err);
     return res.status(500).json({ error: 'Communication error with payment gateway.' });
   }
 
-  // Extract from Moolre Metadata
-  const { phone, quantity, voucher_type } = moolreData.metadata;
-  const amount = moolreData.amount;
-
   const client = await pool.connect();
-
   try {
-    // 2. IDEMPOTENCY: Check if already processed
-    const existing = await client.query(
-      'SELECT status FROM transactions WHERE reference = $1',
+    // 2. Load order details from DB (set during init-payment)
+    const txRow = await client.query(
+      'SELECT * FROM transactions WHERE reference = $1',
       [reference]
     );
 
-    if (existing.rows.length > 0) {
+    // 2a. Already fully processed — return existing vouchers
+    if (txRow.rows.length > 0 && txRow.rows[0].status === 'success') {
       const vouchers = await client.query(
         'SELECT serial, pin, type FROM vouchers WHERE transaction_ref = $1',
         [reference]
       );
-      return res.status(200).json({ 
-        success: true, 
-        preorder: existing.rows[0].status === 'preorder',
-        vouchers: vouchers.rows 
+      return res.status(200).json({ success: true, vouchers: vouchers.rows });
+    }
+
+    // 2b. Already a preorder
+    if (txRow.rows.length > 0 && txRow.rows[0].status === 'preorder') {
+      return res.status(200).json({
+        success: true,
+        preorder: true,
+        message: 'Payment confirmed. Out of stock — vouchers will be sent via SMS soon.',
       });
     }
 
-    // 3. STOCK CHECK
+    // 2c. Read order details from the 'initialized' transaction row
+    if (txRow.rows.length === 0) {
+      console.error('verify-payment: no transaction row found for ref', reference);
+      return res.status(404).json({ error: 'Order not found. Please contact support.' });
+    }
+
+    const { phone, quantity, voucher_type, amount } = txRow.rows[0];
+
+    // 3. Attempt to grab vouchers
     const voucherResult = await client.query(
-      `SELECT id, serial, pin, type FROM vouchers 
-       WHERE type = $1 AND status = 'available' 
-       ORDER BY id ASC LIMIT $2 FOR UPDATE SKIP LOCKED`,
+      `SELECT id, serial, pin, type FROM vouchers
+       WHERE type = $1 AND status = 'available'
+       ORDER BY id ASC LIMIT $2
+       FOR UPDATE SKIP LOCKED`,
       [voucher_type, parseInt(quantity)]
     );
 
     if (voucherResult.rows.length < parseInt(quantity)) {
-      // 4. PREORDER LOGIC: Insert into both tables
+      // Out of stock → preorder
       await client.query(
         `INSERT INTO preorders (reference, phone, amount, quantity, voucher_type, status)
          VALUES ($1, $2, $3, $4, $5, 'pending') ON CONFLICT (reference) DO NOTHING`,
         [reference, phone, parseFloat(amount), parseInt(quantity), voucher_type]
       );
-      
       await client.query(
-        `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status)
-         VALUES ($1, $2, $3, $4, $5, 'preorder') ON CONFLICT (reference) DO NOTHING`,
-        [reference, phone, parseFloat(amount), parseInt(quantity), voucher_type]
+        `UPDATE transactions SET status = 'preorder' WHERE reference = $1`,
+        [reference]
       );
 
-      await sendAdminAlert(`STOCK ALERT: Pre-order created for ${phone}. ${voucher_type} x${quantity}. Ref: ${reference}`);
+      await sendAdminAlert(
+        `PREORDER: ${voucher_type} x${quantity} from ${phone}. Ref: ${reference}. Upload vouchers.`
+      );
 
-      return res.status(200).json({ 
-        success: true, 
+      return res.status(200).json({
+        success: true,
         preorder: true,
-        message: 'Payment confirmed. Out of stock - vouchers will be sent via SMS soon.'
+        message: 'Payment confirmed. Out of stock — vouchers will be sent via SMS soon.',
       });
     }
 
-    // 5. SUCCESSFUL FULFILLMENT
+    // 4. Mark vouchers as sold
     const voucherIds = voucherResult.rows.map(v => v.id);
-
     await client.query(
-      `UPDATE vouchers SET status = 'sold', sold_to = $1, transaction_ref = $2, sold_at = NOW() 
+      `UPDATE vouchers SET status = 'sold', sold_to = $1, transaction_ref = $2, sold_at = NOW()
        WHERE id = ANY($3)`,
       [phone, reference, voucherIds]
     );
 
+    // 5. Update transaction to success
     await client.query(
-      `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status)
-       VALUES ($1, $2, $3, $4, $5, 'success') ON CONFLICT (reference) DO NOTHING`,
-      [reference, phone, parseFloat(amount), parseInt(quantity), voucher_type]
+      `UPDATE transactions SET status = 'success' WHERE reference = $1`,
+      [reference]
     );
 
-    // 6. Notifications
+    // 6. Send SMS and stock alert
     await sendVoucherSMS(phone, voucherResult.rows, voucher_type);
     await checkAndAlertStock(voucher_type);
 
     return res.status(200).json({
       success: true,
-      vouchers: voucherResult.rows
+      vouchers: voucherResult.rows,
     });
 
   } catch (err) {
-    console.error("Critical DB Error:", err);
-    return res.status(500).json({ error: "Internal server error during voucher allocation." });
+    console.error('verify-payment DB error:', err);
+    return res.status(500).json({ error: 'Internal server error during voucher allocation.' });
   } finally {
     client.release();
   }
