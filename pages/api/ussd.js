@@ -27,7 +27,7 @@
 
 import pool from '../../lib/db';
 import { getSetting, getPrices } from '../../lib/settings';
-import { sendWhatsAppAlert } from '../../lib/whatsapp';
+import { sendAdminAlert, checkAndAlertStock } from '../../lib/alerts';
 
 // In-memory store (replace with DB for serverless)
 const SESSIONS = {};
