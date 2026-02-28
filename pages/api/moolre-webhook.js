@@ -19,6 +19,7 @@ import pool from '../../lib/db';
 import { sendAdminAlert, checkAndAlertStock } from '../../lib/alerts';
 
 async function sendVoucherSMS(phone, vouchers, voucherType) {
+  const formattedPhone = phone.startsWith('0') ? '233' + phone.slice(1) : phone;
   const lines = vouchers.map((v, i) => `${i + 1}. Serial: ${v.serial} PIN: ${v.pin}`);
   const message =
     `Your WAEC ${voucherType} checker voucher(s):\n` +
@@ -28,7 +29,7 @@ async function sendVoucherSMS(phone, vouchers, voucherType) {
   await fetch('https://sms.arkesel.com/api/v2/sms/send', {
     method: 'POST',
     headers: { 'api-key': process.env.ARKESEL_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sender: 'WAEC-GH', message, recipients: [phone] }),
+    body: JSON.stringify({ sender: 'WAEC-GH', message, recipients: [formattedPhone] }),
   });
 }
 
