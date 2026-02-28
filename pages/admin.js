@@ -990,40 +990,7 @@ export default function Admin() {
                 </div>
               </div>
 
-              {/* Moolre Credentials Info */}
-              <div className="bg-indigo-50 border border-indigo-100 rounded-2xl p-6">
-                <div className="flex items-start gap-3">
-                  <AlertCircle size={18} className="text-indigo-600 flex-shrink-0 mt-0.5" />
-                  <div>
-                    <h3 className="font-black text-sm text-indigo-800 mb-2">Moolre & API Configuration</h3>
-                    <p className="text-xs text-indigo-700 leading-relaxed">
-                      Moolre keys, Arkesel SMS key, database URL, and admin credentials are configured via environment variables in your <code className="bg-indigo-100 px-1 rounded">.env.local</code> file. Update these directly on your server or hosting platform.
-                    </p>
-                    <div className="mt-3 grid grid-cols-2 gap-2 text-[10px] font-mono text-indigo-600">
-                      {['MOOLRE_SECRET_KEY', 'NEXT_PUBLIC_MOOLRE_PUBLIC_KEY', 'NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER', 'ARKESEL_API_KEY', 'ULTRAMSG_TOKEN', 'ULTRAMSG_INSTANCE_ID', 'DATABASE_URL', 'ADMIN_USERNAME', 'ADMIN_PASSWORD'].map(k => (
-                        <div key={k} className="bg-indigo-100 rounded px-2 py-1 truncate">{k}</div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </div>
 
-              {/* USSD Info */}
-              <div className="bg-white border border-black/[0.06] rounded-2xl p-6 shadow-sm">
-                <div className="flex items-center gap-3 mb-4">
-                  <div className="w-10 h-10 bg-violet-100 rounded-xl flex items-center justify-center">
-                    <Phone size={18} className="text-violet-600" />
-                  </div>
-                  <div>
-                    <h3 className="font-black text-sm">USSD Integration</h3>
-                    <p className="text-xs text-black/40">Your backend USSD endpoint is ready at <code className="bg-gray-100 px-1 rounded">/api/ussd</code></p>
-                  </div>
-                </div>
-                <p className="text-xs text-black/50 leading-relaxed">
-                  The USSD service uses the same database as the web app. Configure your USSD provider (GiantSMS, etc.) to POST to <strong>/api/ussd</strong> with <code>msisdn</code>, <code>msgType</code>, and <code>text</code> parameters.
-                  The USSD flow supports buying WASSCE, BECE, and CSSPS vouchers via Mobile Money push prompts.
-                </p>
-              </div>
             </div>
           </div>
         )}
