@@ -1,139 +1,154 @@
 import pool from '../../lib/db';
 import { sendAdminAlert, checkAndAlertStock } from '../../lib/alerts';
 
-// ... keep your sendVoucherSMS function exactly as it is ...
+/**
+ * Helper to send SMS via Arkesel
+ */
 async function sendVoucherSMS(phone, vouchers, voucherType) {
-  // ... (Keep existing code)
+  const lines = vouchers.map((v, i) => `${i + 1}. Serial: ${v.serial} PIN: ${v.pin}`);
+  const message =
+    `Your WAEC ${voucherType} checker voucher(s):\n` + lines.join('\n') +
+    '\nVisit waecgh.org to check results. Thank you!';
+
+  try {
+    await fetch('https://sms.arkesel.com/api/v2/sms/send', {
+      method: 'POST',
+      headers: { 
+        'api-key': process.env.ARKESEL_API_KEY, 
+        'Content-Type': 'application/json' 
+      },
+      body: JSON.stringify({ sender: 'WAEC-GH', message, recipients: [phone] }),
+    });
+  } catch (err) {
+    console.error('SMS Delivery Error:', err);
+  }
 }
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  // WE ONLY NEED REFERENCE NOW
   const { reference } = req.body;
 
   if (!reference) {
-    return res.status(400).json({ error: 'Missing payment reference' });
+    return res.status(400).json({ error: 'Missing reference' });
   }
 
-  const client = await pool.connect();
-  
+  // 1. Fetch Transaction Status & Metadata from Moolre
+  // This replaces the need for localStorage by getting the order info from the provider
+  let moolreData;
   try {
-    // 1. LOOKUP TRANSACTION DETAILS
-    const txResult = await client.query(
-      'SELECT * FROM transactions WHERE reference = $1',
+    const statusRes = await fetch('https://api.moolre.com/open/transact/status', {
+      method: 'POST',
+      headers: {
+        'X-API-USER': process.env.MOOLRE_USERNAME,
+        'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        type: 1,
+        idtype: 1, // Lookup by externalref
+        id: reference,
+        accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+      }),
+    });
+
+    const result = await statusRes.json();
+    moolreData = result?.data;
+
+    if (!moolreData || moolreData.txstatus === 2) {
+      return res.status(402).json({ error: 'Payment failed or was rejected by the provider.' });
+    }
+    
+    if (moolreData.txstatus !== 1) {
+      return res.status(202).json({ status: 'pending', message: 'Payment is still being processed.' });
+    }
+  } catch (err) {
+    console.error('Moolre Verify Error:', err);
+    return res.status(500).json({ error: 'Communication error with payment gateway.' });
+  }
+
+  // 2. Extract Details from Metadata (Sent during init-payment)
+  const { phone, quantity, voucher_type } = moolreData.metadata;
+  const amount = moolreData.amount;
+
+  const client = await pool.connect();
+  try {
+    // 3. IDEMPOTENCY CHECK: Has this reference already been processed in our DB?
+    const existingTx = await client.query(
+      'SELECT status FROM transactions WHERE reference = $1',
       [reference]
     );
 
-    if (txResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Transaction not found.' });
-    }
-
-    const transaction = txResult.rows[0];
-    const { phone, quantity, voucher_type: voucherType, amount, status } = transaction;
-
-    // 2. IDEMPOTENCY CHECK (If already successful, just return vouchers)
-    if (status === 'success') {
-       const soldVouchers = await client.query(
-         'SELECT serial, pin FROM vouchers WHERE transaction_ref = $1',
-         [reference]
-       );
-       return res.status(200).json({ success: true, vouchers: soldVouchers.rows });
-    }
-
-    // 3. CHECK MOOLRE STATUS
-    let txstatus;
-    try {
-      const statusRes = await fetch('https://api.moolre.com/open/transact/status', {
-        method: 'POST',
-        headers: {
-          'X-API-USER': process.env.MOOLRE_USERNAME,
-          'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            type: 1, 
-            idtype: 1, 
-            id: reference, 
-            accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER 
-        }),
+    if (existingTx.rows.length > 0) {
+      // If found, fetch the vouchers already assigned to this reference
+      const savedVouchers = await client.query(
+        'SELECT serial, pin, type FROM vouchers WHERE transaction_ref = $1',
+        [reference]
+      );
+      return res.status(200).json({ 
+        success: true, 
+        preorder: existingTx.rows[0].status === 'preorder',
+        vouchers: savedVouchers.rows 
       });
-
-      const statusData = await statusRes.json();
-      txstatus = statusData?.data?.txstatus; // 1=Success
-
-      if (txstatus === 2) {
-        await client.query("UPDATE transactions SET status = 'failed' WHERE reference = $1", [reference]);
-        return res.status(402).json({ error: 'Payment failed or was rejected.' });
-      }
-      if (txstatus !== 1) {
-        return res.status(202).json({ status: 'pending', message: 'Payment processing...' });
-      }
-    } catch (err) {
-      console.error('Status check error:', err);
-      return res.status(500).json({ error: 'Payment verification error.' });
     }
 
-    // 4. CHECK STOCK
+    // 4. STOCK CHECK: Attempt to grab available vouchers
     const voucherResult = await client.query(
-      `SELECT id, serial, pin FROM vouchers
+      `SELECT id, serial, pin, type FROM vouchers
        WHERE type = $1 AND status = 'available'
        ORDER BY id ASC LIMIT $2
        FOR UPDATE SKIP LOCKED`,
-      [voucherType, parseInt(quantity)]
+      [voucher_type, parseInt(quantity)]
     );
 
-    // 5. HANDLE OUT OF STOCK (Preorder)
+    // 5. CASE A: OUT OF STOCK (Preorder)
     if (voucherResult.rows.length < parseInt(quantity)) {
-      // Update the EXISTING transaction to preorder (don't insert new)
       await client.query(
-        `UPDATE transactions SET status = 'preorder' WHERE reference = $1`,
-        [reference]
-      );
-      
-      // Add to preorders table if you use that for specific tracking
-      await client.query(
-        `INSERT INTO preorders (reference, phone, amount, quantity, voucher_type, status)
-         VALUES ($1, $2, $3, $4, $5, 'pending') 
-         ON CONFLICT (reference) DO NOTHING`,
-        [reference, phone, parseFloat(amount), parseInt(quantity), voucherType]
+        `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status)
+         VALUES ($1, $2, $3, $4, $5, 'preorder')`,
+        [reference, phone, parseFloat(amount), parseInt(quantity), voucher_type]
       );
 
-      await sendAdminAlert(`PREORDER: ${voucherType} x${quantity} (Ref: ${reference}) - Stock exhausted.`);
+      await sendAdminAlert(
+        `STOCK EXHAUSTED: ${voucher_type} x${quantity} for ${phone}. Transaction saved as Preorder. Ref: ${reference}`
+      );
 
       return res.status(200).json({
         success: true,
         preorder: true,
-        message: 'Out of stock. You will receive vouchers via SMS shortly.',
+        message: 'Payment verified. Vouchers will be sent via SMS once restocked.'
       });
     }
 
-    // 6. FULFILL ORDER
-    const ids = voucherResult.rows.map((v) => v.id);
-    
-    // Mark vouchers sold
+    // 6. CASE B: SUCCESSFUL FULFILLMENT
+    const idsToUpdate = voucherResult.rows.map((v) => v.id);
+
+    // Update Vouchers to 'sold'
     await client.query(
       `UPDATE vouchers SET status = 'sold', sold_to = $1, transaction_ref = $2, sold_at = NOW()
        WHERE id = ANY($3)`,
-      [phone, reference, ids]
+      [phone, reference, idsToUpdate]
     );
 
-    // Update Transaction to Success
+    // Insert into Transactions Table (Matching your provided schema)
     await client.query(
-      `UPDATE transactions SET status = 'success' WHERE reference = $1`,
-      [reference]
+      `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status)
+       VALUES ($1, $2, $3, $4, $5, 'success')`,
+      [reference, phone, parseFloat(amount), parseInt(quantity), voucher_type]
     );
 
-    // Send SMS & Alert
-    // Note: Pass voucherResult.rows explicitly as second arg
-    await sendVoucherSMS(phone, voucherResult.rows, voucherType);
-    await checkAndAlertStock(voucherType);
+    // 7. Post-Processing: SMS & Stock Alerts
+    await sendVoucherSMS(phone, voucherResult.rows, voucher_type);
+    await checkAndAlertStock(voucher_type);
 
     return res.status(200).json({
       success: true,
-      vouchers: voucherResult.rows.map((v) => ({ serial: v.serial, pin: v.pin })),
+      vouchers: voucherResult.rows.map(v => ({ serial: v.serial, pin: v.pin, type: v.type }))
     });
 
+  } catch (dbErr) {
+    console.error('Database fulfillment error:', dbErr);
+    return res.status(500).json({ error: 'Internal server error during voucher allocation.' });
   } finally {
     client.release();
   }
