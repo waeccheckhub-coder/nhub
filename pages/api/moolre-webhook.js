@@ -68,22 +68,12 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Resolve order details from preorder or transaction record
+    // Resolve order details — prefer transaction record (set during init-payment)
     let phone = payer;
     let quantity = 1;
     let voucherType = null;
 
-    const preorderRes = await client.query(
-      'SELECT * FROM preorders WHERE reference = $1',
-      [externalref]
-    );
-
-    if (preorderRes.rows.length > 0) {
-      const po = preorderRes.rows[0];
-      phone = po.phone || payer;
-      quantity = po.quantity;
-      voucherType = po.voucher_type;
-    } else if (existing.rows.length > 0) {
+    if (existing.rows.length > 0) {
       const tx = await client.query(
         'SELECT * FROM transactions WHERE reference = $1',
         [externalref]
@@ -92,6 +82,20 @@ export default async function handler(req, res) {
         phone = tx.rows[0].phone || payer;
         quantity = tx.rows[0].quantity;
         voucherType = tx.rows[0].voucher_type;
+      }
+    }
+
+    // Fall back to preorder table if transaction record missing details
+    if (!voucherType) {
+      const preorderRes = await client.query(
+        'SELECT * FROM preorders WHERE reference = $1',
+        [externalref]
+      );
+      if (preorderRes.rows.length > 0) {
+        const po = preorderRes.rows[0];
+        phone = po.phone || payer;
+        quantity = po.quantity;
+        voucherType = po.voucher_type;
       }
     }
 
