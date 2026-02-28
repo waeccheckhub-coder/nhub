@@ -160,7 +160,9 @@ export default function Admin() {
     try {
       const res = await axios.post('/api/admin/upload', formData);
       const s = res.data.summary;
-      toast.success(`${s.uploaded} added${s.preordersFulfilled > 0 ? `, ${s.preordersFulfilled} preorder(s) auto-fulfilled` : ''}`);
+      const failedMsg = s.failed > 0 ? `, ${s.failed} failed` : '';
+      const preorderMsg = s.preordersFulfilled > 0 ? `, ${s.preordersFulfilled} preorder(s) auto-fulfilled` : '';
+      toast.success(`${s.uploaded} added${failedMsg}${preorderMsg}`);
       setFile(null); setManualSerial(''); setManualPin('');
       fetchStats(); if (activeTab === 'vouchers') fetchVouchers();
     } catch (e) { toast.error('Upload failed'); }
@@ -181,7 +183,7 @@ export default function Admin() {
     const doc = new jsPDF({ orientation: 'landscape' });
     doc.setFontSize(16); doc.setTextColor(79, 70, 229);
     doc.text('WAEC GH Checkers — Voucher Export', 14, 20);
-    doc.autoTable({ head: [['#', 'Type', 'Serial', 'PIN', 'Status', 'Sold To']], body: toExport.map((v, i) => [i + 1, v.type, v.serial, v.pin, v.status, v.sold_to || '-']), startY: 30, headStyles: { fillColor: [79, 70, 229] }, styles: { fontSize: 8 } });
+    doc.autoTable({ head: [['#', 'Type', 'Serial', 'PIN', 'Status', 'Sold To', 'Created', 'Sold At']], body: toExport.map((v, i) => [i + 1, v.type, v.serial, v.pin, v.status, v.sold_to || '-', v.created_at ? new Date(v.created_at).toLocaleDateString() : '-', v.sold_at ? new Date(v.sold_at).toLocaleDateString() : '-']), startY: 30, headStyles: { fillColor: [79, 70, 229] }, styles: { fontSize: 8 } });
     doc.save(`vouchers_${Date.now()}.pdf`); toast.success('PDF downloaded!');
   };
 
@@ -331,7 +333,7 @@ export default function Admin() {
                   {/* Stats Grid */}
                   <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-6">
                     <StatCard label="Total" value={stats.stats.total} icon={Package} accent="indigo" />
-                    <StatCard label="Available" value={stats.stats.available} icon={CheckCircle} accent="emerald" />
+                    <StatCard label="Available" value={stats.stats.available} icon={CheckCircle} accent="emerald" sub="Ready to sell" />
                     <StatCard label="Sold" value={stats.stats.sold} icon={DollarSign} accent="blue" />
                     <StatCard label="Used" value={stats.stats.used} icon={CheckCircle} accent="violet" />
                     <StatCard label="Revenue" value={`GHS ${(stats.stats.revenue || 0).toFixed(0)}`} icon={TrendingUp} accent="amber" />
@@ -703,6 +705,7 @@ export default function Admin() {
                       <div>
                         <span className="text-[9px] font-black text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded">{po.voucher_type} ×{po.quantity}</span>
                         <p className="text-xs font-bold mt-1 flex items-center gap-1"><Phone size={11} className="text-black/30" />{po.phone}</p>
+                        {po.name && <p className="text-xs text-black/50 mt-0.5">{po.name}</p>}
                       </div>
                       <StatusBadge status={po.status} />
                     </div>
@@ -728,12 +731,13 @@ export default function Admin() {
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead className="bg-[#fafafa] border-b border-black/[0.05] text-[9px] font-black uppercase tracking-widest text-black/40">
-                      <tr>{['Customer', 'Type', 'Qty', 'Amount', 'Reference', 'Status', 'Date', 'Action'].map(h => <th key={h} className="px-5 py-3 text-left">{h}</th>)}</tr>
+                      <tr>{['Customer', 'Name', 'Type', 'Qty', 'Amount', 'Reference', 'Status', 'Date', 'Action'].map(h => <th key={h} className="px-5 py-3 text-left">{h}</th>)}</tr>
                     </thead>
                     <tbody className="divide-y divide-black/[0.04]">
                       {preorders.map(po => (
                         <tr key={po.id} className="hover:bg-[#fafafa] transition-colors">
                           <td className="px-5 py-3 text-xs font-semibold flex items-center gap-1"><Phone size={12} className="text-black/30" />{po.phone}</td>
+                          <td className="px-5 py-3 text-xs text-black/60">{po.name || '-'}</td>
                           <td className="px-5 py-3"><span className="text-[9px] font-black text-indigo-600 bg-indigo-50 px-2 py-1 rounded">{po.voucher_type}</span></td>
                           <td className="px-5 py-3 text-xs">{po.quantity}</td>
                           <td className="px-5 py-3 text-xs font-bold text-emerald-600">GHS {po.amount}</td>
