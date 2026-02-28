@@ -207,11 +207,11 @@ export default function Admin() {
     <div className="min-h-screen bg-[#fafafa] flex items-center justify-center">
       <div className="flex flex-col items-center gap-4">
         <Fingerprint size={40} className="animate-pulse text-black/20" />
-        <span className="text-[10px] font-black uppercase tracking-[0.3em] text-black/40">Authenticating...</span>
+        <span className="text-[10px] font-black uppercase tracking-[0.3em] text-black/40">Loading...</span>
       </div>
     </div>
   );
-  if (status !== 'authenticated') return null;
+  if (!session) return null;
 
   const pendingPreorders = preorders.filter(p => p.status === 'pending').length;
 
@@ -931,4 +931,4 @@ function UploadForm({ uploadType, setUploadType, inputMode, setInputMode, manual
   );
 }
 
-export const getServerSideProps = async () => ({ props: {} });
+export { getServerSideProps } from '../lib/adminAuth';
