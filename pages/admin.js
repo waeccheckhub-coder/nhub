@@ -903,20 +903,20 @@ export default function Admin() {
             </div>
 
             <div className="space-y-6">
-              {/* WhatsApp Alert Settings */}
+              {/* SMS Alert Settings */}
               <div className="bg-white border border-black/[0.06] rounded-2xl p-6 shadow-sm">
                 <div className="flex items-center gap-3 mb-5">
                   <div className="w-10 h-10 bg-emerald-100 rounded-xl flex items-center justify-center">
                     <Phone size={18} className="text-emerald-600" />
                   </div>
                   <div>
-                    <h3 className="font-black text-sm">WhatsApp Alerts</h3>
-                    <p className="text-xs text-black/40">Receive stock and pre-order alerts via WhatsApp</p>
+                    <h3 className="font-black text-sm">SMS Alerts</h3>
+                    <p className="text-xs text-black/40">Receive stock and pre-order alerts via SMS</p>
                   </div>
                 </div>
                 <div className="space-y-4">
                   <div>
-                    <label className="text-[10px] font-black uppercase tracking-[0.2em] text-black/40 block mb-2">Customer Support WhatsApp Number</label>
+                    <label className="text-[10px] font-black uppercase tracking-[0.2em] text-black/40 block mb-2">Customer Support Phone Number</label>
                     {settingsEditing ? (
                       <input value={settingsDraft.support_whatsapp || ''}
                         onChange={e => setSettingsDraft(d => ({ ...d, support_whatsapp: e.target.value }))}
@@ -927,21 +927,21 @@ export default function Admin() {
                         {settings.support_whatsapp || <span className="text-black/30">Not set</span>}
                       </p>
                     )}
-                    <p className="text-[10px] text-black/30 mt-1">This number appears as a \"Chat with Support\" button on the customer-facing website.</p>
+                    <p className="text-[10px] text-black/30 mt-1">This number appears as a &quot;Contact Support&quot; button on the customer-facing website.</p>
                   </div>
                   <div>
-                    <label className="text-[10px] font-black uppercase tracking-[0.2em] text-black/40 block mb-2">Admin WhatsApp Number</label>
+                    <label className="text-[10px] font-black uppercase tracking-[0.2em] text-black/40 block mb-2">Admin Phone Number (for SMS alerts)</label>
                     {settingsEditing ? (
-                      <input value={settingsDraft.admin_whatsapp || ''}
-                        onChange={e => setSettingsDraft(d => ({ ...d, admin_whatsapp: e.target.value }))}
+                      <input value={settingsDraft.admin_phone || ''}
+                        onChange={e => setSettingsDraft(d => ({ ...d, admin_phone: e.target.value }))}
                         placeholder="e.g. 0244123456"
                         className="w-full border border-black/10 rounded-xl px-4 py-3 text-sm outline-none focus:border-indigo-400" />
                     ) : (
                       <p className="text-sm font-semibold py-3 px-4 bg-[#fafafa] rounded-xl border border-black/[0.06]">
-                        {settings.admin_whatsapp || <span className="text-black/30">Not set</span>}
+                        {settings.admin_phone || <span className="text-black/30">Not set</span>}
                       </p>
                     )}
-                    <p className="text-[10px] text-black/30 mt-1">You'll get alerts when stock drops below 5 or runs out.</p>
+                    <p className="text-[10px] text-black/30 mt-1">You&apos;ll get SMS alerts when stock drops below threshold or runs out.</p>
                   </div>
                   <div>
                     <label className="text-[10px] font-black uppercase tracking-[0.2em] text-black/40 block mb-2">Low Stock Threshold</label>
