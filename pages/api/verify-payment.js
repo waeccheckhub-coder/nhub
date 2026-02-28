@@ -1,129 +1,167 @@
-import db from '../../lib/db';
-import axios from 'axios';
-import { getSetting, ensurePreordersTable } from '../../lib/settings';
-import { checkAndAlertStock } from '../../lib/whatsapp';
+// POST /api/verify-payment
+// Called from /thank-you page after Moolre redirects back.
+// Checks payment status then assigns vouchers or saves a preorder.
+// Docs: POST https://api.moolre.com/open/transact/status
 
-const MOOLRE_API_BASE = process.env.MOOLRE_API_BASE || 'https://api.moolre.com/v2';
+import pool from '../../lib/db';
+import { getSetting } from '../../lib/settings';
+import { sendWhatsAppAlert, checkAndAlertStock } from '../../lib/whatsapp';
+
+async function sendVoucherSMS(phone, vouchers, voucherType) {
+  const arkeselKey = process.env.ARKESEL_API_KEY;
+  const lines = vouchers.map(
+    (v, i) => `${i + 1}. Serial: ${v.serial} PIN: ${v.pin}`
+  );
+  const message =
+    `Your WAEC ${voucherType} checker voucher(s):\n` + lines.join('\n') +
+    '\nVisit waecgh.org to check results. Thank you!';
+
+  await fetch('https://sms.arkesel.com/api/v2/sms/send', {
+    method: 'POST',
+    headers: {
+      'api-key': arkeselKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      sender: 'WAEC-GH',
+      message,
+      recipients: [phone],
+    }),
+  });
+}
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).end();
-  const { reference, quantity, type, phone, name, isPreorder } = req.body;
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
+  const { reference, phone, quantity, voucherType, amount } = req.body;
+
+  if (!reference || !phone || !quantity || !voucherType) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  // 1. Check payment status with Moolre
+  let txstatus;
   try {
-    // 1. Verify Payment with Moolre
-    // NOTE: Confirm exact endpoint at https://docs.moolre.com
-    const moolreRes = await axios.get(
-      `${MOOLRE_API_BASE}/transactions/${reference}`,
-      { headers: { Authorization: `Bearer ${process.env.MOOLRE_SECRET_KEY}` } }
-    );
+    const statusRes = await fetch('https://api.moolre.com/open/transact/status', {
+      method: 'POST',
+      headers: {
+        'X-API-USER': process.env.MOOLRE_USERNAME,
+        'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        type: 1,
+        idtype: 1,           // 1 = lookup by externalref
+        id: reference,
+        accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+      }),
+    });
 
-    const txData = moolreRes.data?.data || moolreRes.data;
-    const isSuccess = ['success', 'successful', 'completed', 'paid'].includes(
-      (txData?.status || '').toLowerCase()
-    );
+    const statusData = await statusRes.json();
 
-    if (!isSuccess) {
-      return res.status(400).json({ error: 'Payment not verified' });
+    // txstatus: 1=Successful, 0=Pending, 2=Failed
+    txstatus = statusData?.data?.txstatus;
+
+    if (txstatus === 2) {
+      return res.status(402).json({ error: 'Payment failed or was rejected.' });
     }
 
-    const verifiedAmount = txData.amount;
-    const qty = parseInt(quantity);
+    if (txstatus !== 1) {
+      // Pending — tell the client to wait
+      return res.status(202).json({ status: 'pending', message: 'Payment is still being processed.' });
+    }
+  } catch (err) {
+    console.error('verify-payment status check error:', err);
+    return res.status(500).json({ error: 'Could not verify payment status.' });
+  }
 
-    // 2. Check stock
-    const stockRes = await db.query(
-      "SELECT COUNT(*) as count FROM vouchers WHERE type = $1 AND status = 'available'",
-      [type]
+  // 2. Prevent duplicate fulfillment
+  const client = await pool.connect();
+  try {
+    const existing = await client.query(
+      'SELECT id FROM transactions WHERE reference = $1',
+      [reference]
     );
-    const stockCount = parseInt(stockRes.rows[0].count);
-
-    // 3. Pre-order mode: if stock insufficient, queue as preorder
-    if (isPreorder || stockCount < qty) {
-      await ensurePreordersTable();
-      await db.query(
-        `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW()) ON CONFLICT (reference) DO NOTHING`,
-        [reference, phone, name || '', verifiedAmount, qty, type]
+    if (existing.rows.length > 0) {
+      // Already processed — just return the vouchers
+      const vouchers = await client.query(
+        'SELECT serial, pin FROM vouchers WHERE transaction_ref = $1 AND type = $2',
+        [reference, voucherType]
       );
-      try {
-        await db.query(
-          `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-           VALUES ($1, $2, $3, $4, $5, 'preorder', NOW()) ON CONFLICT (reference) DO NOTHING`,
-          [reference, phone, verifiedAmount, qty, type]
-        );
-      } catch (_) {}
+      return res.status(200).json({ success: true, vouchers: vouchers.rows });
+    }
 
-      // SMS customer
-      const formattedPhone = phone.startsWith('0') ? '233' + phone.slice(1) : phone;
-      try {
-        await axios.get(`https://sms.arkesel.com/sms/api`, {
-          params: {
-            action: 'send-sms', api_key: process.env.ARKESEL_API_KEY, to: formattedPhone, from: 'CheckerCard',
-            sms: `Thank you for your ${type} purchase (Ref: ${reference}). Vouchers are temporarily out of stock. We'll SMS them as soon as they're available!`,
-          }
-        });
-      } catch (_) {}
+    // 3. Attempt to grab available vouchers
+    const voucherResult = await client.query(
+      `SELECT id, serial, pin FROM vouchers
+       WHERE type = $1 AND status = 'available'
+       ORDER BY id ASC
+       LIMIT $2
+       FOR UPDATE SKIP LOCKED`,
+      [voucherType, parseInt(quantity)]
+    );
 
-      // Alert admin
+    if (voucherResult.rows.length < parseInt(quantity)) {
+      // Out of stock → save preorder
+      await client.query(
+        `INSERT INTO preorders (reference, phone, amount, quantity, voucher_type, status)
+         VALUES ($1, $2, $3, $4, $5, 'pending')
+         ON CONFLICT (reference) DO NOTHING`,
+        [reference, phone, parseFloat(amount), parseInt(quantity), voucherType]
+      );
+
+      // Record transaction as preorder
+      await client.query(
+        `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status)
+         VALUES ($1, $2, $3, $4, $5, 'preorder')
+         ON CONFLICT (reference) DO NOTHING`,
+        [reference, phone, parseFloat(amount), parseInt(quantity), voucherType]
+      );
+
+      // Notify admin via WhatsApp
       const adminPhone = await getSetting('admin_whatsapp');
       if (adminPhone) {
-        const { sendWhatsAppAlert } = await import('../../lib/whatsapp');
-        await sendWhatsAppAlert(adminPhone,
-          `📋 *NEW PRE-ORDER*\nCustomer: ${phone}\nType: ${type}\nQty: ${qty}\nAmount: GHS ${verifiedAmount}\nRef: ${reference}\n\n⚠️ Stock insufficient. Please upload vouchers ASAP!`
+        await sendWhatsAppAlert(
+          adminPhone,
+          `⚠️ New Preorder!\nType: ${voucherType}\nQty: ${quantity}\nPhone: ${phone}\nRef: ${reference}\nStock exhausted — please upload vouchers.`
         );
       }
 
-      return res.status(200).json({ success: true, preorder: true, message: 'Payment confirmed. Vouchers will be sent when stock is available.', vouchers: [] });
+      return res.status(200).json({
+        success: true,
+        preorder: true,
+        message: 'Payment received but vouchers are currently out of stock. You will receive them via SMS once restocked.',
+      });
     }
 
-    // 4. Fetch available vouchers
-    const vouchers = await db.query(
-      'SELECT id, serial, pin FROM vouchers WHERE type = $1 AND status = $2 LIMIT $3',
-      [type, 'available', qty]
+    // 4. Mark vouchers as sold
+    const ids = voucherResult.rows.map((v) => v.id);
+    await client.query(
+      `UPDATE vouchers
+       SET status = 'sold', sold_to = $1, transaction_ref = $2, sold_at = NOW()
+       WHERE id = ANY($3)`,
+      [phone, reference, ids]
     );
-    if (vouchers.rowCount < qty) return res.status(400).json({ error: 'OUT_OF_STOCK' });
 
-    // 5. Mark as sold
-    const voucherIds = vouchers.rows.map(v => v.id);
-    await db.query('UPDATE vouchers SET status = $1, sold_to = $2, sold_at = NOW() WHERE id = ANY($3)', ['sold', phone, voucherIds]);
+    // 5. Record transaction
+    await client.query(
+      `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status)
+       VALUES ($1, $2, $3, $4, $5, 'success')
+       ON CONFLICT (reference) DO NOTHING`,
+      [reference, phone, parseFloat(amount), parseInt(quantity), voucherType]
+    );
 
-    // 6. Record transaction
-    try {
-      await db.query(
-        `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-         VALUES ($1, $2, $3, $4, $5, 'success', NOW()) ON CONFLICT (reference) DO NOTHING`,
-        [reference, phone, verifiedAmount, qty, type]
-      );
-    } catch (_) {}
+    // 6. Send SMS with vouchers
+    await sendVoucherSMS(phone, voucherResult.rows, voucherType);
 
-    // 7. Portal links
-    const getPortalLink = (t) => {
-      const u = (t || '').toUpperCase();
-      if (u.includes('WASSCE') || u.includes('NOVDEC')) return 'https://ghana.waecdirect.org';
-      if (u.includes('BECE')) return 'https://eresults.waecgh.org';
-      if (u.includes('CSSPS') || u.includes('PLACEMENT')) return 'https://www.cssps.gov.gh';
-      return 'https://waeccardsonline.com';
-    };
+    // 7. Check stock alert
+    await checkAndAlertStock(voucherType);
 
-    // 8. SMS
-    const voucherDetails = vouchers.rows.map(v => `S/N: ${v.serial} PIN: ${v.pin}`).join('\n');
-    const formattedPhone2 = phone.startsWith('0') ? '233' + phone.slice(1) : phone;
-    try {
-      await axios.get(`https://sms.arkesel.com/sms/api`, {
-        params: {
-          action: 'send-sms', api_key: process.env.ARKESEL_API_KEY, to: formattedPhone2, from: 'CheckerCard',
-          sms: `CheckerCard: Your ${type} purchase was successful.\n\n${voucherDetails}\n\nCheck Result: ${getPortalLink(type)}\n\nThank you!`,
-        }
-      });
-    } catch (e) { console.error('SMS error:', e.message); }
-
-    // 9. Stock alerts
-    const adminPhone = await getSetting('admin_whatsapp');
-    if (adminPhone) await checkAndAlertStock(db, adminPhone);
-
-    return res.status(200).json({ vouchers: vouchers.rows });
-
-  } catch (error) {
-    console.error('Verify error:', error?.response?.data || error.message);
-    return res.status(500).json({ error: 'Internal server error' });
+    return res.status(200).json({
+      success: true,
+      vouchers: voucherResult.rows.map((v) => ({ serial: v.serial, pin: v.pin })),
+    });
+  } finally {
+    client.release();
   }
 }
