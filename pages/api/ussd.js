@@ -15,7 +15,7 @@
 //   reply      — boolean: true=keep session open, false=end session
 //
 // ⚠️  In-memory SESSIONS only works on persistent servers (PM2/VPS).
-//     On Vercel/serverless, store sessions in the DB using ussd_sessions table below.
+//     On Vercel/serverless, store sessions in the DB using the table below:
 //
 // CREATE TABLE IF NOT EXISTS ussd_sessions (
 //   session_id VARCHAR(100) PRIMARY KEY,
@@ -26,20 +26,18 @@
 // );
 
 import pool from '../../lib/db';
-import { getSetting, getPrices } from '../../lib/settings';
-import { sendAdminAlert, checkAndAlertStock } from '../../lib/alerts';
+import { getPrices } from '../../lib/settings';
+import { sendAdminAlert } from '../../lib/alerts';
 
-// In-memory store (replace with DB for serverless)
+// In-memory store (replace with DB queries for serverless)
 const SESSIONS = {};
 
 function getSession(sessionId) {
   return SESSIONS[sessionId] || { stage: 'MENU' };
 }
-
 function setSession(sessionId, data) {
   SESSIONS[sessionId] = data;
 }
-
 function clearSession(sessionId) {
   delete SESSIONS[sessionId];
 }
@@ -81,9 +79,7 @@ export default async function handler(req, res) {
       const choice = userInput?.trim();
       const typeMap = { '1': 'WASSCE', '2': 'BECE', '3': 'CSSPS' };
 
-      if (choice === '0') {
-        return respond('Thank you. Goodbye!', false);
-      }
+      if (choice === '0') return respond('Thank you. Goodbye!', false);
 
       if (!typeMap[choice]) {
         return respond(
@@ -95,8 +91,7 @@ export default async function handler(req, res) {
       const voucherType = typeMap[choice];
       setSession(sessionId, { stage: 'SELECT_QTY', voucherType });
       return respond(
-        `You selected ${voucherType} @ GHS ${prices[voucherType]} each.\n` +
-        `How many vouchers? (1-5)`,
+        `You selected ${voucherType} @ GHS ${prices[voucherType]} each.\nHow many vouchers? (1-5)`,
         true
       );
     }
@@ -112,10 +107,7 @@ export default async function handler(req, res) {
       setSession(sessionId, { stage: 'CONFIRM', voucherType, quantity: qty, total });
 
       return respond(
-        `Confirm order:\n` +
-        `${qty}x ${voucherType} = GHS ${total}\n` +
-        `Phone: ${msisdn}\n\n` +
-        `1. Confirm\n2. Cancel`,
+        `Confirm order:\n${qty}x ${voucherType} = GHS ${total}\nPhone: ${msisdn}\n\n1. Confirm\n2. Cancel`,
         true
       );
     }
@@ -124,39 +116,27 @@ export default async function handler(req, res) {
       const { voucherType, quantity, total } = session;
       const choice = userInput?.trim();
 
-      if (choice === '2') {
-        return respond('Order cancelled. Goodbye!', false);
-      }
+      if (choice === '2') return respond('Order cancelled. Goodbye!', false);
+      if (choice !== '1') return respond('Please press 1 to confirm or 2 to cancel:', true);
 
-      if (choice !== '1') {
-        return respond('Please press 1 to confirm or 2 to cancel:', true);
-      }
-
-      // Save preorder — Moolre collects payment within their USSD session
-      // The webhook will fire and deliver vouchers when payment completes
+      // Save preorder — Moolre collects payment within their USSD session.
+      // The webhook fires and delivers vouchers when payment completes.
       try {
         const ref = `ussd_${sessionId}_${Date.now()}`;
         await pool.query(
           `INSERT INTO preorders (reference, phone, amount, quantity, voucher_type, status)
-           VALUES ($1, $2, $3, $4, $5, 'pending')
-           ON CONFLICT (reference) DO NOTHING`,
+           VALUES ($1, $2, $3, $4, $5, 'pending') ON CONFLICT (reference) DO NOTHING`,
           [ref, msisdn, parseFloat(total), quantity, voucherType]
         );
-
         await pool.query(
           `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status)
-           VALUES ($1, $2, $3, $4, $5, 'pending')
-           ON CONFLICT (reference) DO NOTHING`,
+           VALUES ($1, $2, $3, $4, $5, 'pending') ON CONFLICT (reference) DO NOTHING`,
           [ref, msisdn, parseFloat(total), quantity, voucherType]
         );
 
-        const adminPhone = await getSetting('admin_whatsapp');
-        if (adminPhone) {
-          await sendWhatsAppAlert(
-            adminPhone,
-            `📱 USSD Order Initiated\nType: ${voucherType}\nQty: ${quantity}\nAmount: GHS ${total}\nPhone: ${msisdn}\nRef: ${ref}`
-          );
-        }
+        await sendAdminAlert(
+          `USSD Order: ${voucherType} x${quantity} GHS ${total} from ${msisdn}. Ref: ${ref}`
+        );
 
         return respond(
           `Order placed! GHS ${total} will be deducted from your MoMo.\n` +
@@ -172,9 +152,6 @@ export default async function handler(req, res) {
 
     default:
       setSession(sessionId, { stage: 'MENU' });
-      return respond(
-        `WAEC GH Checkers\n1. WASSCE\n2. BECE\n3. CSSPS\n0. Exit`,
-        true
-      );
+      return respond(`WAEC GH Checkers\n1. WASSCE\n2. BECE\n3. CSSPS\n0. Exit`, true);
   }
 }
