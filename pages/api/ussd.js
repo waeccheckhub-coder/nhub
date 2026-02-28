@@ -1,145 +1,180 @@
-import db from '../../lib/db';
-import axios from 'axios';
-import { getPrices, ensurePreordersTable } from '../../lib/settings';
+// POST /api/ussd
+// Moolre USSD callback — confirmed field names from docs:
+//
+// REQUEST:
+//   sessionId  — unique session ID (persists across interaction)
+//   new        — boolean, true if this is the first request
+//   msisdn     — customer phone number e.g. "233241235993"
+//   network    — integer: 3=MTN, 5=AT, 6=Telecel
+//   message    — string the user typed (empty on first request)
+//   extension  — the extension dialled
+//   data       — additional data
+//
+// RESPONSE:
+//   message    — text to display on screen (keep under 160 chars)
+//   reply      — boolean: true=keep session open, false=end session
+//
+// ⚠️  In-memory SESSIONS only works on persistent servers (PM2/VPS).
+//     On Vercel/serverless, store sessions in the DB using ussd_sessions table below.
+//
+// CREATE TABLE IF NOT EXISTS ussd_sessions (
+//   session_id VARCHAR(100) PRIMARY KEY,
+//   stage VARCHAR(50) NOT NULL DEFAULT 'MENU',
+//   voucher_type VARCHAR(50),
+//   quantity INTEGER DEFAULT 1,
+//   updated_at TIMESTAMP DEFAULT NOW()
+// );
 
-/**
- * USSD Service Handler
- * Configure your USSD provider (e.g. GiantSMS, AfricasTalking) to POST here.
- * 
- * Expected payload: { msisdn, msgType, text, sessionId }
- * msgType "1" or "0" = new session, "2" = continuation
- *
- * This uses the same DB as the web frontend — same stock, same vouchers.
- */
+import pool from '../../lib/db';
+import { getSetting, getPrices } from '../../lib/settings';
+import { sendWhatsAppAlert } from '../../lib/whatsapp';
 
-const SESSIONS = {}; // In-memory session store (use Redis in production)
+// In-memory store (replace with DB for serverless)
+const SESSIONS = {};
+
+function getSession(sessionId) {
+  return SESSIONS[sessionId] || { stage: 'MENU' };
+}
+
+function setSession(sessionId, data) {
+  SESSIONS[sessionId] = data;
+}
+
+function clearSession(sessionId) {
+  delete SESSIONS[sessionId];
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
 
-  const { msisdn, msgType, text, sessionId, session_id, ussdServiceOp } = req.body;
-  const phone = msisdn?.toString();
-  const sid = sessionId || session_id || phone;
-  const isNew = msgType === '1' || msgType === '0' || text === '' || ussdServiceOp === 'USSD_REQUEST';
-  const input = (text || '').trim().split('*').pop(); // Get last menu selection
+  // Confirmed Moolre USSD field names
+  const { sessionId, new: isNew, msisdn, message: userInput } = req.body;
 
-  if (isNew) SESSIONS[sid] = { step: 'main' };
-  const session = SESSIONS[sid] || { step: 'main' };
-  const prices = await getPrices();
-
-  let response = '';
-  let action = 'con';
-
-  try {
-    if (session.step === 'main' || isNew) {
-      response = `Welcome to WAEC GH Checkers\n1. Buy WASSCE (GHS ${prices.WASSCE})\n2. Buy BECE (GHS ${prices.BECE})\n3. Buy CSSPS/Placement (GHS ${prices.CSSPS})\n4. Retrieve Vouchers`;
-      SESSIONS[sid] = { step: 'menu' };
-
-    } else if (session.step === 'menu') {
-      if (input === '1') {
-        const stock = await getStock('WASSCE');
-        SESSIONS[sid] = { step: 'qty', type: 'WASSCE', price: prices.WASSCE };
-        response = `WASSCE Checker (GHS ${prices.WASSCE} each)\n${stock > 0 ? `In Stock: ${stock}` : 'Pre-order available'}\nEnter Quantity (1-10):`;
-      } else if (input === '2') {
-        const stock = await getStock('BECE');
-        SESSIONS[sid] = { step: 'qty', type: 'BECE', price: prices.BECE };
-        response = `BECE Checker (GHS ${prices.BECE} each)\n${stock > 0 ? `In Stock: ${stock}` : 'Pre-order available'}\nEnter Quantity (1-10):`;
-      } else if (input === '3') {
-        const stock = await getStock('CSSPS');
-        SESSIONS[sid] = { step: 'qty', type: 'CSSPS', price: prices.CSSPS };
-        response = `School Placement (GHS ${prices.CSSPS} each)\n${stock > 0 ? `In Stock: ${stock}` : 'Pre-order available'}\nEnter Quantity (1-10):`;
-      } else if (input === '4') {
-        SESSIONS[sid] = { step: 'retrieve' };
-        response = 'Retrieve Vouchers\nYour vouchers will be sent via SMS to this number.\n\n1. Send my vouchers';
-      } else {
-        response = 'Invalid option. Please try again.\n1. WASSCE\n2. BECE\n3. CSSPS\n4. Retrieve';
-      }
-
-    } else if (session.step === 'qty') {
-      const qty = parseInt(input);
-      if (isNaN(qty) || qty < 1 || qty > 10) {
-        response = 'Please enter a valid quantity between 1 and 10:';
-      } else {
-        const total = session.price * qty;
-        SESSIONS[sid] = { ...session, step: 'confirm', qty };
-        response = `Confirm Purchase:\n${qty}x ${session.type}\nTotal: GHS ${total}\n\n1. Confirm & Pay\n2. Cancel`;
-      }
-
-    } else if (session.step === 'confirm') {
-      if (input === '1') {
-        const total = session.price * session.qty;
-        // Trigger MoMo payment prompt
-        // This would integrate with your mobile money push API
-        // For now, log and inform user
-        const reference = `USSD-${session.type}-${Date.now()}`;
-        
-        // You'll integrate a mobile money push (e.g. MTN API, Hubtel) here
-        // The customer would receive a USSD push to approve payment
-        // After approval, verify and deliver vouchers
-
-        action = 'end';
-        response = `Processing GHS ${total} payment...\n\nAuthorize the Mobile Money prompt on your phone.\n\nRef: ${reference}\n\nVouchers will be sent via SMS after payment.`;
-
-        // In production, initiate the payment push here and handle callback
-        SESSIONS[sid] = {};
-      } else {
-        action = 'end';
-        response = 'Purchase cancelled. Goodbye!';
-        SESSIONS[sid] = {};
-      }
-
-    } else if (session.step === 'retrieve') {
-      if (input === '1') {
-        const vouchers = await db.query(
-          "SELECT type, serial, pin FROM vouchers WHERE sold_to = $1 ORDER BY sold_at DESC LIMIT 5",
-          [phone]
-        );
-        if (vouchers.rowCount === 0) {
-          response = 'No vouchers found for this number.';
-        } else {
-          // Send via SMS
-          const details = vouchers.rows.map(v => `${v.type}: S/N ${v.serial} PIN ${v.pin}`).join('\n');
-          try {
-            const formatted = phone.startsWith('0') ? '233' + phone.slice(1) : phone;
-            await axios.get(`https://sms.arkesel.com/sms/api`, {
-              params: {
-                action: 'send-sms', api_key: process.env.ARKESEL_API_KEY,
-                to: formatted, from: 'CheckerCard',
-                sms: `Your WAEC GH vouchers:\n\n${details}\n\nContact support if you need help.`,
-              }
-            });
-          } catch (_) {}
-          response = `Found ${vouchers.rowCount} voucher(s).\nDetails sent via SMS to ${phone}.`;
-        }
-        action = 'end';
-        SESSIONS[sid] = {};
-      } else {
-        action = 'end';
-        response = 'Goodbye!';
-        SESSIONS[sid] = {};
-      }
-
-    } else {
-      response = 'Session expired. Please dial again.';
-      action = 'end';
-      SESSIONS[sid] = {};
-    }
-
-  } catch (err) {
-    console.error('USSD error:', err.message);
-    response = 'Service unavailable. Please try again later.';
-    action = 'end';
+  if (!sessionId) {
+    return res.status(400).json({ message: 'Invalid request', reply: false });
   }
 
-  // Format for different USSD providers
-  // GiantSMS format
-  return res.status(200).json({ message: response, action });
+  const respond = (message, keepOpen = true) => {
+    if (!keepOpen) clearSession(sessionId);
+    return res.json({ message, reply: keepOpen });
+  };
 
-  // For AfricasTalking, uncomment below:
-  // return res.status(200).send(`${action === 'con' ? 'CON' : 'END'} ${response}`);
-}
+  const prices = await getPrices();
 
-async function getStock(type) {
-  const res = await db.query("SELECT COUNT(*) as count FROM vouchers WHERE type = $1 AND status = 'available'", [type]);
-  return parseInt(res.rows[0].count);
+  // New session — show main menu
+  if (isNew) {
+    setSession(sessionId, { stage: 'MENU' });
+    return respond(
+      `Welcome to WAEC GH Checkers\n` +
+      `1. WASSCE (GHS ${prices.WASSCE})\n` +
+      `2. BECE (GHS ${prices.BECE})\n` +
+      `3. CSSPS (GHS ${prices.CSSPS})\n` +
+      `0. Exit`,
+      true
+    );
+  }
+
+  const session = getSession(sessionId);
+
+  switch (session.stage) {
+    case 'MENU': {
+      const choice = userInput?.trim();
+      const typeMap = { '1': 'WASSCE', '2': 'BECE', '3': 'CSSPS' };
+
+      if (choice === '0') {
+        return respond('Thank you. Goodbye!', false);
+      }
+
+      if (!typeMap[choice]) {
+        return respond(
+          `Invalid choice. Please select:\n1. WASSCE\n2. BECE\n3. CSSPS\n0. Exit`,
+          true
+        );
+      }
+
+      const voucherType = typeMap[choice];
+      setSession(sessionId, { stage: 'SELECT_QTY', voucherType });
+      return respond(
+        `You selected ${voucherType} @ GHS ${prices[voucherType]} each.\n` +
+        `How many vouchers? (1-5)`,
+        true
+      );
+    }
+
+    case 'SELECT_QTY': {
+      const qty = parseInt(userInput?.trim());
+      if (isNaN(qty) || qty < 1 || qty > 5) {
+        return respond('Please enter a number between 1 and 5:', true);
+      }
+
+      const { voucherType } = session;
+      const total = (prices[voucherType] * qty).toFixed(2);
+      setSession(sessionId, { stage: 'CONFIRM', voucherType, quantity: qty, total });
+
+      return respond(
+        `Confirm order:\n` +
+        `${qty}x ${voucherType} = GHS ${total}\n` +
+        `Phone: ${msisdn}\n\n` +
+        `1. Confirm\n2. Cancel`,
+        true
+      );
+    }
+
+    case 'CONFIRM': {
+      const { voucherType, quantity, total } = session;
+      const choice = userInput?.trim();
+
+      if (choice === '2') {
+        return respond('Order cancelled. Goodbye!', false);
+      }
+
+      if (choice !== '1') {
+        return respond('Please press 1 to confirm or 2 to cancel:', true);
+      }
+
+      // Save preorder — Moolre collects payment within their USSD session
+      // The webhook will fire and deliver vouchers when payment completes
+      try {
+        const ref = `ussd_${sessionId}_${Date.now()}`;
+        await pool.query(
+          `INSERT INTO preorders (reference, phone, amount, quantity, voucher_type, status)
+           VALUES ($1, $2, $3, $4, $5, 'pending')
+           ON CONFLICT (reference) DO NOTHING`,
+          [ref, msisdn, parseFloat(total), quantity, voucherType]
+        );
+
+        await pool.query(
+          `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status)
+           VALUES ($1, $2, $3, $4, $5, 'pending')
+           ON CONFLICT (reference) DO NOTHING`,
+          [ref, msisdn, parseFloat(total), quantity, voucherType]
+        );
+
+        const adminPhone = await getSetting('admin_whatsapp');
+        if (adminPhone) {
+          await sendWhatsAppAlert(
+            adminPhone,
+            `📱 USSD Order Initiated\nType: ${voucherType}\nQty: ${quantity}\nAmount: GHS ${total}\nPhone: ${msisdn}\nRef: ${ref}`
+          );
+        }
+
+        return respond(
+          `Order placed! GHS ${total} will be deducted from your MoMo.\n` +
+          `You will receive your voucher(s) via SMS after payment.\n` +
+          `Ref: ${ref.slice(-8)}`,
+          false
+        );
+      } catch (err) {
+        console.error('USSD confirm error:', err);
+        return respond('An error occurred. Please try again later.', false);
+      }
+    }
+
+    default:
+      setSession(sessionId, { stage: 'MENU' });
+      return respond(
+        `WAEC GH Checkers\n1. WASSCE\n2. BECE\n3. CSSPS\n0. Exit`,
+        true
+      );
+  }
 }
