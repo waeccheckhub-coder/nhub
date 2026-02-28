@@ -34,6 +34,7 @@ export default async function handler(req, res) {
 
   // 1. Verify payment status with Moolre
   let txstatus;
+  let moolreData;
   try {
     const statusRes = await fetch('https://api.moolre.com/open/transact/status', {
       method: 'POST',
@@ -51,9 +52,10 @@ export default async function handler(req, res) {
     });
 
     const result = await statusRes.json();
-    txstatus = result?.data?.txstatus;
+    moolreData = result?.data;
+    txstatus = moolreData?.txstatus;
 
-    if (!result?.data || txstatus === 2) {
+    if (!moolreData || txstatus === 2) {
       return res.status(402).json({ error: 'Payment failed or was rejected.' });
     }
     if (txstatus !== 1) {
@@ -90,13 +92,24 @@ export default async function handler(req, res) {
       });
     }
 
-    // 2c. Read order details from the 'initialized' transaction row
-    if (txRow.rows.length === 0) {
-      console.error('verify-payment: no transaction row found for ref', reference);
-      return res.status(404).json({ error: 'Order not found. Please contact support.' });
-    }
+    // 2c. Read order details — from DB row if it exists, otherwise fall back
+    // to Moolre metadata (for orders placed before the DB-first init-payment change)
+    let phone, quantity, voucher_type, amount;
 
-    const { phone, quantity, voucher_type, amount } = txRow.rows[0];
+    if (txRow.rows.length > 0) {
+      ({ phone, quantity, voucher_type, amount } = txRow.rows[0]);
+    } else {
+      // Legacy fallback: read from Moolre status response metadata
+      const meta = moolreData?.metadata;
+      if (!meta?.phone || !meta?.quantity || !meta?.voucher_type) {
+        console.error('verify-payment: no DB row and no Moolre metadata for ref', reference);
+        return res.status(404).json({ error: 'Order not found. Please contact support with your reference: ' + reference });
+      }
+      phone = meta.phone;
+      quantity = meta.quantity;
+      voucher_type = meta.voucher_type;
+      amount = moolreData.amount || 0;
+    }
 
     // 3. Attempt to grab vouchers
     const voucherResult = await client.query(
