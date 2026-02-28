@@ -1,24 +1,15 @@
-// POST /api/verify-payment
 import pool from '../../lib/db';
 import { sendAdminAlert, checkAndAlertStock } from '../../lib/alerts';
 
+// ... keep your sendVoucherSMS function exactly as it is ...
 async function sendVoucherSMS(phone, vouchers, voucherType) {
-  const lines = vouchers.map((v, i) => `${i + 1}. Serial: ${v.serial} PIN: ${v.pin}`);
-  const message =
-    `Your WAEC ${voucherType} checker voucher(s):\n` + lines.join('\n') +
-    '\nVisit waecgh.org to check results. Thank you!';
-
-  await fetch('https://sms.arkesel.com/api/v2/sms/send', {
-    method: 'POST',
-    headers: { 'api-key': process.env.ARKESEL_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sender: 'WAEC-GH', message, recipients: [phone] }),
-  });
+  // ... (Keep existing code)
 }
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  // CHANGED: We only expect reference now.
+  // WE ONLY NEED REFERENCE NOW
   const { reference } = req.body;
 
   if (!reference) {
@@ -28,33 +19,29 @@ export default async function handler(req, res) {
   const client = await pool.connect();
   
   try {
-    // 1. RETRIEVE MISSING DATA FROM DB
-    // We look for the record created during the "initiate" phase
+    // 1. LOOKUP TRANSACTION DETAILS
     const txResult = await client.query(
-      'SELECT phone, quantity, voucher_type, amount, status FROM transactions WHERE reference = $1',
+      'SELECT * FROM transactions WHERE reference = $1',
       [reference]
     );
 
     if (txResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Transaction record not found.' });
+      return res.status(404).json({ error: 'Transaction not found.' });
     }
 
     const transaction = txResult.rows[0];
+    const { phone, quantity, voucher_type: voucherType, amount, status } = transaction;
 
-    // Check if already fulfilled to avoid double processing
-    if (transaction.status === 'success') {
-       // Fetch the assigned vouchers to show them again
-       const assignedVouchers = await client.query(
+    // 2. IDEMPOTENCY CHECK (If already successful, just return vouchers)
+    if (status === 'success') {
+       const soldVouchers = await client.query(
          'SELECT serial, pin FROM vouchers WHERE transaction_ref = $1',
          [reference]
        );
-       return res.status(200).json({ success: true, vouchers: assignedVouchers.rows });
+       return res.status(200).json({ success: true, vouchers: soldVouchers.rows });
     }
 
-    // Destructure the data we retrieved from DB
-    const { phone, quantity, voucher_type: voucherType, amount } = transaction;
-
-    // 2. Check payment status with Moolre
+    // 3. CHECK MOOLRE STATUS
     let txstatus;
     try {
       const statusRes = await fetch('https://api.moolre.com/open/transact/status', {
@@ -65,30 +52,29 @@ export default async function handler(req, res) {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          type: 1,
-          idtype: 1, 
-          id: reference,
-          accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+            type: 1, 
+            idtype: 1, 
+            id: reference, 
+            accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER 
         }),
       });
 
       const statusData = await statusRes.json();
-      txstatus = statusData?.data?.txstatus; 
+      txstatus = statusData?.data?.txstatus; // 1=Success
 
       if (txstatus === 2) {
-        // Update DB to failed
         await client.query("UPDATE transactions SET status = 'failed' WHERE reference = $1", [reference]);
         return res.status(402).json({ error: 'Payment failed or was rejected.' });
       }
       if (txstatus !== 1) {
-        return res.status(202).json({ status: 'pending', message: 'Payment is still being processed.' });
+        return res.status(202).json({ status: 'pending', message: 'Payment processing...' });
       }
     } catch (err) {
-      console.error('verify-payment status check error:', err);
-      return res.status(500).json({ error: 'Could not verify payment status.' });
+      console.error('Status check error:', err);
+      return res.status(500).json({ error: 'Payment verification error.' });
     }
 
-    // 3. Attempt to grab available vouchers
+    // 4. CHECK STOCK
     const voucherResult = await client.query(
       `SELECT id, serial, pin FROM vouchers
        WHERE type = $1 AND status = 'available'
@@ -97,15 +83,15 @@ export default async function handler(req, res) {
       [voucherType, parseInt(quantity)]
     );
 
-    // 4. Handle Out of Stock
+    // 5. HANDLE OUT OF STOCK (Preorder)
     if (voucherResult.rows.length < parseInt(quantity)) {
-      // Update existing transaction to preorder
+      // Update the EXISTING transaction to preorder (don't insert new)
       await client.query(
         `UPDATE transactions SET status = 'preorder' WHERE reference = $1`,
         [reference]
       );
       
-      // Upsert into preorders (just in case)
+      // Add to preorders table if you use that for specific tracking
       await client.query(
         `INSERT INTO preorders (reference, phone, amount, quantity, voucher_type, status)
          VALUES ($1, $2, $3, $4, $5, 'pending') 
@@ -113,33 +99,33 @@ export default async function handler(req, res) {
         [reference, phone, parseFloat(amount), parseInt(quantity), voucherType]
       );
 
-      await sendAdminAlert(
-        `PREORDER: ${voucherType} x${quantity} from ${phone}. Ref: ${reference}. Stock exhausted - upload vouchers.`
-      );
+      await sendAdminAlert(`PREORDER: ${voucherType} x${quantity} (Ref: ${reference}) - Stock exhausted.`);
 
       return res.status(200).json({
         success: true,
         preorder: true,
-        message: 'Payment received but vouchers are currently out of stock. You will receive them via SMS once restocked.',
+        message: 'Out of stock. You will receive vouchers via SMS shortly.',
       });
     }
 
-    // 5. Mark vouchers as sold
+    // 6. FULFILL ORDER
     const ids = voucherResult.rows.map((v) => v.id);
+    
+    // Mark vouchers sold
     await client.query(
       `UPDATE vouchers SET status = 'sold', sold_to = $1, transaction_ref = $2, sold_at = NOW()
        WHERE id = ANY($3)`,
       [phone, reference, ids]
     );
 
-    // 6. Update transaction to success
-    // (We UPDATE now, because we INSERTED at step 1)
+    // Update Transaction to Success
     await client.query(
       `UPDATE transactions SET status = 'success' WHERE reference = $1`,
       [reference]
     );
 
-    // 7. Send SMS & Alerts
+    // Send SMS & Alert
+    // Note: Pass voucherResult.rows explicitly as second arg
     await sendVoucherSMS(phone, voucherResult.rows, voucherType);
     await checkAndAlertStock(voucherType);
 
@@ -147,6 +133,7 @@ export default async function handler(req, res) {
       success: true,
       vouchers: voucherResult.rows.map((v) => ({ serial: v.serial, pin: v.pin })),
     });
+
   } finally {
     client.release();
   }
