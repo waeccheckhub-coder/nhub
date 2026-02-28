@@ -1,0 +1,9 @@
+{
+  "redirects": [
+    {
+      "source": "/api/ussd.js",
+      "destination": "/api/ussd",
+      "permanent": false
+    }
+  ]
+}
