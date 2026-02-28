@@ -5,7 +5,7 @@
 
 import pool from '../../lib/db';
 import { getSetting } from '../../lib/settings';
-import { sendWhatsAppAlert, checkAndAlertStock } from '../../lib/whatsapp';
+import { sendAdminAlert, checkAndAlertStock } from '../../lib/alerts';
 
 async function sendVoucherSMS(phone, vouchers, voucherType) {
   const arkeselKey = process.env.ARKESEL_API_KEY;
