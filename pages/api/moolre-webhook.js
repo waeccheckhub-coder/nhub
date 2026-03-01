@@ -1,166 +1,192 @@
-// POST /api/moolre-webhook
-// Moolre POSTs this when a payment completes (async backup to the redirect flow).
-//
-// Webhook payload shape (confirmed from docs):
-// {
-//   status: 1, code: "P01", message: "Transaction Successful",
-//   data: {
-//     txstatus: 1,             // 1=Successful, 0=Pending, 2=Failed
-//     payer: "233xxxxxxxxx",   // customer phone
-//     amount: "15.21",
-//     externalref: "waec_xxx", // YOUR reference
-//     secret: "c80b20ce-...", // verify against MOOLRE_WEBHOOK_SECRET
-//     transactionid: 32712684,
-//     ts: "2024-11-27 21:11:29"
-//   }
-// }
+import db from '../../lib/db';
+import axios from 'axios';
+import { getSetting } from '../../lib/settings';
+import { checkAndAlertStock } from '../../lib/whatsapp';
+import { formatPhone } from '../../lib/phone';
 
-import pool from '../../lib/db';
-import { sendAdminAlert, checkAndAlertStock } from '../../lib/alerts';
+export const config = { api: { bodyParser: true } };
 
-async function sendVoucherSMS(phone, vouchers, voucherType) {
-  const formattedPhone = phone.startsWith('0') ? '233' + phone.slice(1) : phone;
-  const lines = vouchers.map((v, i) => `${i + 1}. Serial: ${v.serial} PIN: ${v.pin}`);
-  const message =
-    `Your WAEC ${voucherType} checker voucher(s):\n` +
-    lines.join('\n') +
-    '\nVisit waecgh.org to check results. Thank you!';
+function getPortalLink(type) {
+  const t = (type || '').toUpperCase();
+  if (t.includes('WASSCE') || t.includes('NOVDEC')) return 'https://ghana.waecdirect.org';
+  if (t.includes('BECE')) return 'https://eresults.waecgh.org';
+  if (t.includes('CSSPS') || t.includes('PLACEMENT')) return 'https://www.cssps.gov.gh';
+  return 'https://waeccardsonline.com';
+}
 
-  await fetch('https://sms.arkesel.com/api/v2/sms/send', {
-    method: 'POST',
-    headers: { 'api-key': process.env.ARKESEL_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sender: 'WAEC-GH', message, recipients: [formattedPhone] }),
-  });
+async function sendSMS(to, message) {
+  try {
+    await axios.get('https://sms.arkesel.com/sms/api', {
+      params: { action: 'send-sms', api_key: process.env.ARKESEL_API_KEY, to, from: 'CheckerCard', sms: message },
+    });
+  } catch (e) {
+    console.error('SMS error:', e?.response?.data || e.message);
+  }
+}
+
+async function fulfillOrder({ client, phone, quantity, type, amount, reference }) {
+  // Lock available vouchers atomically
+  const vouchers = await client.query(
+    `SELECT id, serial, pin FROM vouchers
+     WHERE type = $1 AND status = 'available'
+     LIMIT $2
+     FOR UPDATE SKIP LOCKED`,
+    [type, quantity]
+  );
+
+  if (vouchers.rowCount < quantity) {
+    return { fulfilled: false, available: vouchers.rowCount };
+  }
+
+  const voucherIds = vouchers.rows.map(v => v.id);
+  await client.query(
+    `UPDATE vouchers SET status = 'sold', sold_to = $1, sold_at = NOW(), transaction_ref = $2
+     WHERE id = ANY($3)`,
+    [phone, reference, voucherIds]
+  );
+
+  await client.query(
+    `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
+     VALUES ($1, $2, $3, $4, $5, 'success', NOW())
+     ON CONFLICT (reference) DO UPDATE SET status = 'success'`,
+    [reference, phone, amount, quantity, type]
+  );
+
+  await client.query(
+    `UPDATE preorders SET status = 'fulfilled', fulfilled_at = NOW()
+     WHERE reference = $1 AND status IN ('initiated', 'pending')`,
+    [reference]
+  );
+
+  return { fulfilled: true, vouchers: vouchers.rows };
 }
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
 
-  const txData = req.body?.data;
+  // Process FIRST, respond after — don't respond before processing in Next.js
+  const payload = req.body;
 
-  if (!txData) {
-    console.warn('Moolre webhook: empty data field', req.body);
-    return res.status(200).end(); // Always 200 to Moolre
-  }
-
-  const { txstatus, externalref, payer, amount, secret } = txData;
-
-  // Optional: verify secret matches your Moolre account secret
-  if (process.env.MOOLRE_WEBHOOK_SECRET && secret !== process.env.MOOLRE_WEBHOOK_SECRET) {
-    console.warn('Moolre webhook: secret mismatch');
-    return res.status(200).end();
-  }
-
-  if (txstatus !== 1) return res.status(200).end();
-
-  if (!externalref) {
-    console.warn('Moolre webhook: no externalref');
-    return res.status(200).end();
-  }
-
-  const client = await pool.connect();
   try {
-    // Check if already fulfilled by the redirect flow
-    const existing = await client.query(
-      'SELECT id, status FROM transactions WHERE reference = $1',
-      [externalref]
-    );
-    if (existing.rows.length > 0 && existing.rows[0].status === 'success') {
-      return res.status(200).end();
+    const reference = payload.reference || payload.transactionReference || payload.ref;
+    const status = (payload.status || '').toLowerCase();
+
+    if (!reference) {
+      return res.status(400).json({ error: 'No reference in payload' });
     }
 
-    // Resolve order details — prefer transaction record (set during init-payment)
-    let phone = payer;
-    let quantity = 1;
-    let voucherType = null;
+    const isSuccess = ['success', 'successful', 'completed', 'paid'].includes(status);
+    if (!isSuccess) {
+      return res.status(200).json({ received: true, note: 'Non-success status, no action taken' });
+    }
 
-    if (existing.rows.length > 0) {
-      const tx = await client.query(
-        'SELECT * FROM transactions WHERE reference = $1',
-        [externalref]
-      );
-      if (tx.rows.length > 0) {
-        phone = tx.rows[0].phone || payer;
-        quantity = tx.rows[0].quantity;
-        voucherType = tx.rows[0].voucher_type;
+    // Idempotency — if already processed, return OK immediately
+    const existingTx = await db.query(
+      `SELECT id FROM transactions WHERE reference = $1 AND status = 'success'`,
+      [reference]
+    );
+    if (existingTx.rowCount > 0) {
+      return res.status(200).json({ received: true, note: 'Already processed' });
+    }
+
+    // Look up the order — try preorders first (covers both web + USSD)
+    const preorderRes = await db.query(
+      `SELECT * FROM preorders WHERE reference = $1`,
+      [reference]
+    );
+
+    let phone, quantity, type, amount;
+
+    if (preorderRes.rowCount > 0) {
+      // Order found in preorders table (saved by init-payment or USSD handler)
+      const order = preorderRes.rows[0];
+      phone = order.phone;
+      quantity = order.quantity;
+      type = order.voucher_type;
+      amount = order.amount;
+    } else {
+      // No preorder found — this can happen if init-payment DB write failed.
+      // Try to extract order details from the webhook payload itself.
+      phone = payload.customerPhone || payload.phone || payload.msisdn || '';
+      quantity = parseInt(payload.quantity || payload.qty || 1);
+      type = payload.voucherType || payload.voucher_type || payload.description?.split('x ')?.[1]?.split(' ')?.[0] || '';
+      amount = payload.amount || 0;
+
+      if (!phone || !type) {
+        // Cannot fulfill without knowing phone and type — log and alert admin
+        console.error('WEBHOOK: Cannot fulfill — no preorder found and payload missing phone/type. Ref:', reference, 'Payload:', JSON.stringify(payload));
+        const adminPhone = await getSetting('admin_whatsapp');
+        if (adminPhone) {
+          const { sendWhatsAppAlert } = await import('../../lib/whatsapp');
+          await sendWhatsAppAlert(adminPhone,
+            `🚨 *WEBHOOK ALERT — MANUAL ACTION REQUIRED*\n\nPayment received but order data not found!\nRef: ${reference}\nAmount: GHS ${amount}\n\nCheck Moolre dashboard and fulfill manually.`
+          );
+        }
+        return res.status(200).json({ received: true, note: 'Payment logged, manual fulfillment needed' });
       }
     }
 
-    // Fall back to preorder table if transaction record missing details
-    if (!voucherType) {
-      const preorderRes = await client.query(
-        'SELECT * FROM preorders WHERE reference = $1',
-        [externalref]
-      );
-      if (preorderRes.rows.length > 0) {
-        const po = preorderRes.rows[0];
-        phone = po.phone || payer;
-        quantity = po.quantity;
-        voucherType = po.voucher_type;
+    // Fulfill with DB-level lock to prevent race conditions with verify-payment
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await fulfillOrder({ client, phone, quantity, type, amount, reference });
+      await client.query('COMMIT');
+      client.release();
+
+      if (result.fulfilled) {
+        // Send vouchers via SMS
+        const voucherDetails = result.vouchers.map(v => `S/N: ${v.serial} PIN: ${v.pin}`).join('\n');
+        await sendSMS(
+          formatPhone(phone),
+          `CheckerCard: Your ${type} voucher(s) are ready!\n\n${voucherDetails}\n\nCheck results: ${getPortalLink(type)}\n\nThank you!`
+        );
+
+        const adminPhone = await getSetting('admin_whatsapp');
+        if (adminPhone) await checkAndAlertStock(db, adminPhone);
+
+        return res.status(200).json({ received: true, fulfilled: true });
+
+      } else {
+        // Insufficient stock — keep as pending, notify customer + admin
+        await db.query(
+          `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
+           VALUES ($1, $2, $3, $4, $5, 'preorder', NOW())
+           ON CONFLICT (reference) DO UPDATE SET status = 'preorder'`,
+          [reference, phone, amount, quantity, type]
+        );
+        await db.query(
+          `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
+           VALUES ($1, $2, 'Customer', $3, $4, $5, 'pending', NOW())
+           ON CONFLICT (reference) DO UPDATE SET status = 'pending'`,
+          [reference, phone, amount, quantity, type]
+        );
+
+        await sendSMS(
+          formatPhone(phone),
+          `CheckerCard: Payment confirmed (Ref: ${reference}). Your ${type} voucher(s) are temporarily out of stock. We will SMS them as soon as they are available. Thank you for your patience.`
+        );
+
+        const adminPhone = await getSetting('admin_whatsapp');
+        if (adminPhone) {
+          const { sendWhatsAppAlert } = await import('../../lib/whatsapp');
+          await sendWhatsAppAlert(adminPhone,
+            `📋 *PRE-ORDER — ACTION NEEDED*\nPhone: ${phone}\nType: ${type}\nQty: ${quantity}\nAmount: GHS ${amount}\nRef: ${reference}\n\n⚠️ Out of stock! Upload vouchers and fulfill from admin panel.`
+          );
+        }
+
+        return res.status(200).json({ received: true, fulfilled: false, note: 'Out of stock — preorder created' });
       }
+
+    } catch (err) {
+      await client.query('ROLLBACK');
+      client.release();
+      throw err;
     }
 
-    if (!voucherType) {
-      console.warn('Moolre webhook: cannot determine voucherType for ref', externalref);
-      return res.status(200).end();
-    }
-
-    // Attempt to grab vouchers
-    const voucherResult = await client.query(
-      `SELECT id, serial, pin FROM vouchers
-       WHERE type = $1 AND status = 'available'
-       ORDER BY id ASC LIMIT $2
-       FOR UPDATE SKIP LOCKED`,
-      [voucherType, quantity]
-    );
-
-    if (voucherResult.rows.length < quantity) {
-      // Still out of stock — ensure preorder exists
-      await client.query(
-        `INSERT INTO preorders (reference, phone, amount, quantity, voucher_type, status)
-         VALUES ($1, $2, $3, $4, $5, 'pending') ON CONFLICT (reference) DO NOTHING`,
-        [externalref, phone, parseFloat(amount || 0), quantity, voucherType]
-      );
-      await client.query(
-        `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status)
-         VALUES ($1, $2, $3, $4, $5, 'preorder') ON CONFLICT (reference) DO NOTHING`,
-        [externalref, phone, parseFloat(amount || 0), quantity, voucherType]
-      );
-
-      await sendAdminAlert(
-        `PREORDER (webhook): ${voucherType} x${quantity} from ${phone}. Ref: ${externalref}. Upload vouchers.`
-      );
-      return res.status(200).end();
-    }
-
-    // Mark vouchers as sold
-    const ids = voucherResult.rows.map((v) => v.id);
-    await client.query(
-      `UPDATE vouchers SET status = 'sold', sold_to = $1, transaction_ref = $2, sold_at = NOW()
-       WHERE id = ANY($3)`,
-      [phone, externalref, ids]
-    );
-
-    await client.query(
-      `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status)
-       VALUES ($1, $2, $3, $4, $5, 'success')
-       ON CONFLICT (reference) DO UPDATE SET status = 'success'`,
-      [externalref, phone, parseFloat(amount || 0), quantity, voucherType]
-    );
-
-    await client.query(
-      `UPDATE preorders SET status = 'fulfilled', fulfilled_at = NOW() WHERE reference = $1`,
-      [externalref]
-    );
-
-    await sendVoucherSMS(phone, voucherResult.rows, voucherType);
-    await checkAndAlertStock(voucherType);
-
-    return res.status(200).end();
   } catch (err) {
-    console.error('moolre-webhook error:', err);
-    return res.status(200).end(); // Always 200 to prevent Moolre retries
-  } finally {
-    client.release();
+    console.error('Webhook error:', err.message);
+    // Still return 200 so Moolre doesn't retry indefinitely
+    return res.status(200).json({ received: true, error: 'Processing failed — check server logs' });
   }
 }
