@@ -1,7 +1,6 @@
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "../auth/[...nextauth]";
 import db from '../../../lib/db';
-import axios from 'axios';
 import { formatPhone } from '../../../lib/phone';
 
 function getPortalLink(type) {
@@ -71,18 +70,20 @@ export default async function handler(req, res) {
       await client.query('COMMIT');
       client.release();
 
-      // Send SMS
-      const voucherDetails = vouchers.rows.map(v => `S/N: ${v.serial} PIN: ${v.pin}`).join('\n');
+      // Send SMS via Arkesel v2
+      const voucherDetails = vouchers.rows.map((v, i) => `${i + 1}. S/N: ${v.serial} PIN: ${v.pin}`).join('\n');
       try {
-        await axios.get('https://sms.arkesel.com/sms/api', {
-          params: {
-            action: 'send-sms',
-            api_key: process.env.ARKESEL_API_KEY,
-            to: formatPhone(phone),
-            from: 'CheckerCard',
-            sms: `CheckerCard: Your ${type} voucher(s) are ready!\n\n${voucherDetails}\n\nCheck results: ${getPortalLink(type)}\n\nSorry for the wait — thank you!`,
-          }
+        const smsRes = await fetch('https://sms.arkesel.com/api/v2/sms/send', {
+          method: 'POST',
+          headers: { 'api-key': process.env.ARKESEL_API_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sender: 'WAEC-GH',
+            message: `CheckerCard: Your ${type} voucher(s) are ready!\n\n${voucherDetails}\n\nCheck results: ${getPortalLink(type)}\n\nSorry for the wait — thank you!`,
+            recipients: [formatPhone(phone)],
+          }),
         });
+        const smsResult = await smsRes.json();
+        if (smsResult.status !== 'success') console.error('Arkesel error:', JSON.stringify(smsResult));
       } catch (e) { console.error('SMS error:', e.message); }
 
       return res.status(200).json({
