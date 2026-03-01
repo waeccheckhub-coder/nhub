@@ -1,10 +1,6 @@
 import db from '../../lib/db';
-import axios from 'axios';
-import { getSetting } from '../../lib/settings';
-import { checkAndAlertStock } from '../../lib/whatsapp';
 import { formatPhone } from '../../lib/phone';
-
-const MOOLRE_API_BASE = process.env.MOOLRE_API_BASE || 'https://api.moolre.com/v2';
+import { sendAdminAlert, checkAndAlertStock } from '../../lib/alerts';
 
 function getPortalLink(type) {
   const t = (type || '').toUpperCase();
@@ -14,139 +10,174 @@ function getPortalLink(type) {
   return 'https://waeccardsonline.com';
 }
 
-async function sendSMS(to, message) {
+async function sendVoucherSMS(phone, vouchers, voucherType) {
+  const lines = vouchers.map((v, i) => `${i + 1}. S/N: ${v.serial} PIN: ${v.pin}`).join('\n');
+  const message =
+    `CheckerCard: Your ${voucherType} voucher(s) are ready!\n\n` +
+    `${lines}\n\n` +
+    `Check results: ${getPortalLink(voucherType)}\n\nThank you!`;
+
   try {
-    await axios.get('https://sms.arkesel.com/sms/api', {
-      params: { action: 'send-sms', api_key: process.env.ARKESEL_API_KEY, to, from: 'CheckerCard', sms: message },
+    const response = await fetch('https://sms.arkesel.com/api/v2/sms/send', {
+      method: 'POST',
+      headers: { 'api-key': process.env.ARKESEL_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sender: 'WAEC-GH', message, recipients: [formatPhone(phone)] }),
     });
+    const result = await response.json();
+    if (result.status !== 'success') {
+      console.error('Arkesel SMS error:', JSON.stringify(result));
+    }
   } catch (e) {
-    console.error('SMS error:', e?.response?.data || e.message);
+    console.error('SMS send failed:', e.message);
   }
 }
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
 
-  const { reference, quantity, type, phone, name } = req.body;
-
+  const { reference } = req.body;
   if (!reference) return res.status(400).json({ error: 'Missing reference' });
 
   try {
-    // IDEMPOTENCY CHECK — if already processed successfully, return the assigned vouchers
-    // This handles page refreshes and double-calls safely.
+    // ── IDEMPOTENCY: already fulfilled ─────────────────────────────────────
     const existingTx = await db.query(
       `SELECT status FROM transactions WHERE reference = $1`,
       [reference]
     );
     if (existingTx.rowCount > 0 && existingTx.rows[0].status === 'success') {
-      // Payment already fulfilled — return the vouchers that were assigned
-      const assignedVouchers = await db.query(
-        `SELECT type, serial, pin FROM vouchers WHERE sold_to = $1 AND transaction_ref = $2`,
-        [phone, reference]
+      // Use transaction_ref (reliable — set when vouchers were sold)
+      const vouchers = await db.query(
+        `SELECT type, serial, pin FROM vouchers WHERE transaction_ref = $1`,
+        [reference]
       );
-      if (assignedVouchers.rowCount > 0) {
-        return res.status(200).json({ vouchers: assignedVouchers.rows });
-      }
-      // transaction_ref column may not be set — try by sold_to + sold_at proximity
-      const assignedByPhone = await db.query(
-        `SELECT type, serial, pin FROM vouchers 
-         WHERE sold_to = $1 AND type = $2 AND status = 'sold'
-         ORDER BY sold_at DESC LIMIT $3`,
-        [phone, type, parseInt(quantity) || 1]
-      );
-      if (assignedByPhone.rowCount > 0) {
-        return res.status(200).json({ vouchers: assignedByPhone.rows });
-      }
+      return res.status(200).json({ vouchers: vouchers.rows });
+    }
+    if (existingTx.rowCount > 0 && existingTx.rows[0].status === 'preorder') {
+      return res.status(200).json({ preorder: true, vouchers: [] });
     }
 
-    // Verify payment with Moolre
-    const moolreRes = await axios.get(
-      `${MOOLRE_API_BASE}/transactions/${reference}`,
-      { headers: { Authorization: `Bearer ${process.env.MOOLRE_SECRET_KEY}` } }
+    // ── VERIFY PAYMENT WITH MOOLRE ──────────────────────────────────────────
+    const moolreRes = await fetch('https://api.moolre.com/open/transact/status', {
+      method: 'POST',
+      headers: {
+        'X-API-USER': process.env.MOOLRE_USERNAME,
+        'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        type: 1,
+        idtype: 1,
+        id: reference,
+        accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+      }),
+    });
+
+    const moolreData = await moolreRes.json();
+    const txData = moolreData?.data;
+    const txstatus = txData?.txstatus;
+
+    if (!txData || txstatus === 2) {
+      return res.status(402).json({ error: 'Payment failed or was rejected.' });
+    }
+    if (txstatus !== 1) {
+      return res.status(202).json({ status: 'pending', message: 'Payment still processing...' });
+    }
+
+    // ── LOAD ORDER DETAILS from DB (most reliable source) ──────────────────
+    const preorderRow = await db.query(
+      `SELECT phone, quantity, voucher_type, amount FROM preorders WHERE reference = $1`,
+      [reference]
     );
 
-    const txData = moolreRes.data?.data || moolreRes.data;
-    const paymentStatus = (txData?.status || '').toLowerCase();
-    const isSuccess = ['success', 'successful', 'completed', 'paid'].includes(paymentStatus);
+    let phone, qty, voucherType, amount;
 
-    if (!isSuccess) {
-      return res.status(400).json({ error: `Payment not confirmed (status: ${paymentStatus})` });
+    if (preorderRow.rowCount > 0) {
+      ({ phone, quantity: qty, voucher_type: voucherType, amount } = preorderRow.rows[0]);
+    } else {
+      // Fallback: read from Moolre metadata (covers old orders without DB row)
+      const meta = txData?.metadata;
+      phone = meta?.phone || txData?.payer || '';
+      qty = parseInt(meta?.quantity || txData?.quantity || 1);
+      voucherType = meta?.voucher_type || '';
+      amount = txData?.amount || 0;
+
+      if (!phone || !voucherType) {
+        console.error('verify-payment: cannot resolve order for ref', reference);
+        return res.status(404).json({
+          error: `Order not found. If you were charged, contact support with reference: ${reference}`,
+        });
+      }
     }
 
-    const verifiedAmount = txData.amount || txData.total || 0;
-    const qty = parseInt(quantity) || 1;
-    const resolvedPhone = phone || txData.customerPhone || txData.phone || '';
+    qty = parseInt(qty);
 
-    // Check stock with a DB-level lock to prevent race conditions
+    // ── ASSIGN VOUCHERS atomically ──────────────────────────────────────────
     const client = await db.connect();
     try {
       await client.query('BEGIN');
 
-      // Lock the rows we want to assign — SKIP LOCKED means concurrent requests
-      // will skip already-locked rows instead of waiting or double-assigning.
       const vouchers = await client.query(
-        `SELECT id, serial, pin, type FROM vouchers 
+        `SELECT id, serial, pin, type FROM vouchers
          WHERE type = $1 AND status = 'available'
          LIMIT $2
          FOR UPDATE SKIP LOCKED`,
-        [type, qty]
+        [voucherType, qty]
       );
 
       if (vouchers.rowCount < qty) {
-        await client.query('ROLLBACK');
-        client.release();
-
-        // Not enough stock — save as preorder
-        await db.query(
+        // Out of stock — create preorder
+        await client.query(
           `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW())
+           VALUES ($1, $2, '', $3, $4, $5, 'pending', NOW())
            ON CONFLICT (reference) DO UPDATE SET status = 'pending'`,
-          [reference, resolvedPhone, name || '', verifiedAmount, qty, type]
+          [reference, phone, parseFloat(amount), qty, voucherType]
         );
-        await db.query(
+        await client.query(
           `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
            VALUES ($1, $2, $3, $4, $5, 'preorder', NOW())
            ON CONFLICT (reference) DO UPDATE SET status = 'preorder'`,
-          [reference, resolvedPhone, verifiedAmount, qty, type]
+          [reference, phone, parseFloat(amount), qty, voucherType]
+        );
+        await client.query('COMMIT');
+        client.release();
+
+        // Notify customer
+        try {
+          await fetch('https://sms.arkesel.com/api/v2/sms/send', {
+            method: 'POST',
+            headers: { 'api-key': process.env.ARKESEL_API_KEY, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              sender: 'WAEC-GH',
+              message: `CheckerCard: Payment confirmed (Ref: ${reference.slice(-8)}). Your ${voucherType} voucher(s) are temporarily out of stock and will be SMS'd as soon as they are available. Thank you!`,
+              recipients: [formatPhone(phone)],
+            }),
+          });
+        } catch (e) { console.error('Preorder SMS error:', e.message); }
+
+        await sendAdminAlert(
+          `PREORDER: ${voucherType} x${qty} from ${phone}. Ref: ${reference}. Upload vouchers!`
         );
 
-        // SMS customer
-        await sendSMS(
-          formatPhone(resolvedPhone),
-          `Thank you for your ${type} purchase (Ref: ${reference}). Vouchers are temporarily out of stock. We will SMS them to you as soon as they are available!`
-        );
-
-        // Alert admin
-        const adminPhone = await getSetting('admin_whatsapp');
-        if (adminPhone) {
-          const { sendWhatsAppAlert } = await import('../../lib/whatsapp');
-          await sendWhatsAppAlert(adminPhone,
-            `📋 *NEW PRE-ORDER*\nCustomer: ${resolvedPhone}\nType: ${type}\nQty: ${qty}\nAmount: GHS ${verifiedAmount}\nRef: ${reference}\n\n⚠️ Upload vouchers ASAP!`
-          );
-        }
-
-        return res.status(200).json({ success: true, preorder: true, vouchers: [] });
+        return res.status(200).json({ preorder: true, vouchers: [] });
       }
 
-      // Assign vouchers atomically
+      // Mark vouchers as sold
       const voucherIds = vouchers.rows.map(v => v.id);
       await client.query(
-        `UPDATE vouchers SET status = 'sold', sold_to = $1, sold_at = NOW(), transaction_ref = $2 
+        `UPDATE vouchers SET status = 'sold', sold_to = $1, sold_at = NOW(), transaction_ref = $2
          WHERE id = ANY($3)`,
-        [resolvedPhone, reference, voucherIds]
+        [phone, reference, voucherIds]
       );
 
-      // Record transaction
       await client.query(
         `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
          VALUES ($1, $2, $3, $4, $5, 'success', NOW())
          ON CONFLICT (reference) DO UPDATE SET status = 'success'`,
-        [reference, resolvedPhone, verifiedAmount, qty, type]
+        [reference, phone, parseFloat(amount), qty, voucherType]
       );
 
-      // Mark preorder as fulfilled (if it existed from init-payment)
       await client.query(
-        `UPDATE preorders SET status = 'fulfilled', fulfilled_at = NOW() 
+        `UPDATE preorders SET status = 'fulfilled', fulfilled_at = NOW()
          WHERE reference = $1 AND status IN ('initiated', 'pending')`,
         [reference]
       );
@@ -154,16 +185,11 @@ export default async function handler(req, res) {
       await client.query('COMMIT');
       client.release();
 
-      // Send SMS with vouchers
-      const voucherDetails = vouchers.rows.map(v => `S/N: ${v.serial} PIN: ${v.pin}`).join('\n');
-      await sendSMS(
-        formatPhone(resolvedPhone),
-        `CheckerCard: Your ${type} purchase was successful.\n\n${voucherDetails}\n\nCheck results: ${getPortalLink(type)}\n\nThank you!`
-      );
+      // Send vouchers via SMS
+      await sendVoucherSMS(phone, vouchers.rows, voucherType);
 
-      // Stock alerts
-      const adminPhone = await getSetting('admin_whatsapp');
-      if (adminPhone) await checkAndAlertStock(db, adminPhone);
+      // Stock alert
+      await checkAndAlertStock(voucherType);
 
       return res.status(200).json({ vouchers: vouchers.rows });
 
@@ -174,7 +200,9 @@ export default async function handler(req, res) {
     }
 
   } catch (error) {
-    console.error('Verify payment error:', error?.response?.data || error.message);
-    return res.status(500).json({ error: 'Internal server error. If you were charged, contact support with ref: ' + reference });
+    console.error('Verify payment error:', error.message);
+    return res.status(500).json({
+      error: `Internal error. If you were charged, contact support with reference: ${reference}`,
+    });
   }
 }
