@@ -53,8 +53,22 @@ export default function Home() {
       toast.dismiss(t);
 
       if (res.data.paymentUrl) {
-        // Redirect to Moolre — order details are stored in DB, no localStorage needed
-        window.location.href = res.data.paymentUrl;
+        // Store order in localStorage (primary) — thank-you page reads this
+        try {
+          localStorage.setItem('pendingOrder', JSON.stringify({
+            reference: res.data.reference, quantity: qty, type: voucherType, phone, name,
+          }));
+        } catch (_) {}
+        // Also embed order details in the return URL as fallback for when localStorage is unavailable
+        const base = res.data.paymentUrl;
+        // The returnUrl is set server-side; Moolre appends the ref automatically.
+        // We stash params in sessionStorage too as secondary fallback.
+        try {
+          sessionStorage.setItem('pendingOrder', JSON.stringify({
+            reference: res.data.reference, quantity: qty, type: voucherType, phone, name,
+          }));
+        } catch (_) {}
+        window.location.href = base;
       } else {
         toast.error('Could not initialize payment. Please try again.');
       }
