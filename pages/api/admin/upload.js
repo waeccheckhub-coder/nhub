@@ -2,41 +2,9 @@ import { getServerSession } from 'next-auth/next';
 import { authOptions } from '../auth/[...nextauth]';
 import db from '../../../lib/db';
 import { sendAdminAlert } from '../../../lib/alerts';
-import { formatPhone } from '../../../lib/phone';
-
-function getPortalLink(type) {
-  const u = (type || '').toUpperCase();
-  if (u.includes('WASSCE') || u.includes('NOVDEC')) return 'https://ghana.waecdirect.org';
-  if (u.includes('BECE')) return 'https://eresults.waecgh.org';
-  if (u.includes('CSSPS') || u.includes('PLACEMENT')) return 'https://www.cssps.gov.gh';
-  return 'https://waeccardsonline.com';
-}
-
-async function sendVoucherSMS(phone, vouchers, voucherType) {
-  const lines = vouchers.map((v, i) => `${i + 1}. S/N: ${v.serial} PIN: ${v.pin}`).join('\n');
-  const message =
-    `CheckerCard: Your ${voucherType} voucher(s) are ready!\n\n` +
-    `${lines}\n\n` +
-    `Check results: ${getPortalLink(voucherType)}\n\nSorry for the wait — thank you!`;
-
-  try {
-    const response = await fetch('https://sms.arkesel.com/api/v2/sms/send', {
-      method: 'POST',
-      headers: { 'api-key': process.env.ARKESEL_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sender: 'WAEC-GH', message, recipients: [formatPhone(phone)] }),
-    });
-    const result = await response.json();
-    if (result.status !== 'success') {
-      console.error('Arkesel SMS error (auto-fulfill):', JSON.stringify(result));
-    }
-  } catch (err) {
-    console.error('Auto-fulfill SMS error:', err.message);
-  }
-}
+import { sendVoucherSMS } from '../../../lib/sms';
 
 async function autoFulfillPreorders(type) {
-  // Only fulfill 'pending' preorders — these are confirmed-paid but out-of-stock
-  // ('initiated' = payment not yet confirmed, so we don't touch those)
   const preorders = await db.query(
     `SELECT * FROM preorders WHERE voucher_type = $1 AND status = 'pending'
      ORDER BY created_at ASC`,
@@ -61,7 +29,6 @@ async function autoFulfillPreorders(type) {
       );
 
       if (vouchers.rows.length < order.quantity) {
-        // Not enough stock for this order yet
         await client.query('ROLLBACK');
         continue;
       }
@@ -89,7 +56,7 @@ async function autoFulfillPreorders(type) {
       await client.query('COMMIT');
       client.release();
 
-      await sendVoucherSMS(order.phone, vouchers.rows, type);
+      await sendVoucherSMS(order.phone, vouchers.rows, type, { waitMessage: true });
       fulfilled++;
     } catch (err) {
       await client.query('ROLLBACK');
