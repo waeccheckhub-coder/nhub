@@ -63,7 +63,7 @@ async function getSession(sessionId) {
       'SELECT stage, voucher_type, quantity, total FROM ussd_sessions WHERE session_id = $1',
       [String(sessionId)]
     );
-    if (r.rows.length === 0) return { stage: 'MENU' };
+    if (r.rows.length === 0) return null; // null = no session row = new session
     const row = r.rows[0];
     return {
       stage:       row.stage || 'MENU',
@@ -132,10 +132,19 @@ export default async function handler(req, res) {
                     body.phone       != null ? String(body.phone).trim()       :
                     body.PhoneNumber != null ? String(body.PhoneNumber).trim() : '';
 
-  const isNew     = body.new   === true || body.new   === 'true' ||
-                    body.isNew === true || body.isNew === 'true';
+  // isNew: Moolre may send boolean true, integer 1, or strings "true"/"1"
+  const isNewFlag =
+    body.new   === true || body.new   === 'true' || body.new   === 1 || body.new   === '1' ||
+    body.isNew === true || body.isNew === 'true' || body.isNew === 1 || body.isNew === '1';
 
-  const userInput = body.message     != null ? String(body.message).trim()     : '';
+  // Moolre sends accumulated USSD string like "1*2*1" — only want the LAST segment
+  const rawMsg    = body.message ?? body.input ?? body.userInput ?? '';
+  const userInput = rawMsg != null && String(rawMsg).includes('*')
+    ? String(rawMsg).split('*').pop().trim()
+    : String(rawMsg ?? '').trim();
+
+  // isNew = flag says so (any truthy form) OR no session row in DB (checked below)
+  const isNew = isNewFlag;
 
   console.log(`[USSD] sessionId="${sessionId}" isNew=${isNew} msisdn="${msisdn}" input="${userInput}"`);
 
@@ -154,7 +163,15 @@ export default async function handler(req, res) {
     const prices = await getPrices();
 
     // ── New session → show main menu ─────────────────────────────────────
-    if (isNew) {
+    // Look up DB — null means no row exists yet (genuinely first request)
+    const existingSession = await getSession(sessionId);
+
+    // Treat as new if flag says so OR no DB record found
+    const isNewSession = isNew || existingSession === null;
+
+    console.log(`[USSD] isNewSession=${isNewSession} existingStage=${existingSession?.stage ?? 'none'}`);
+
+    if (isNewSession) {
       await setSession(sessionId, { stage: 'MENU' });
       return respond(
         `Welcome to WAEC GH Checkers\n` +
@@ -166,7 +183,7 @@ export default async function handler(req, res) {
       );
     }
 
-    const session = await getSession(sessionId);
+    const session = existingSession;
     const choice  = userInput;
 
     console.log(`[USSD] stage="${session.stage}" choice="${choice}"`);
@@ -178,7 +195,7 @@ export default async function handler(req, res) {
         if (choice === '0') return respond('Thank you. Goodbye!', false);
         if (!typeMap[choice]) {
           return respond(
-            `Invalid choice.\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. CSSPS (GHS ${prices.CSSPS})\n0. Exit`,
+            `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. CSSPS (GHS ${prices.CSSPS})\n0. Exit`,
             true
           );
         }
