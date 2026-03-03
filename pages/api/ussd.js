@@ -50,7 +50,6 @@ async function ensureTable() {
       stage        VARCHAR(50)  NOT NULL DEFAULT 'MENU',
       voucher_type VARCHAR(50),
       quantity     INTEGER,
-      total        NUMERIC(10,2),
       updated_at   TIMESTAMP DEFAULT NOW()
     )
   `);
@@ -60,7 +59,7 @@ async function getSession(sessionId) {
   try {
     await ensureTable();
     const r = await pool.query(
-      'SELECT stage, voucher_type, quantity, total FROM ussd_sessions WHERE session_id = $1',
+      'SELECT stage, voucher_type, quantity FROM ussd_sessions WHERE session_id = $1',
       [String(sessionId)]
     );
     if (r.rows.length === 0) return null; // null = no session row = new session
@@ -69,7 +68,6 @@ async function getSession(sessionId) {
       stage:       row.stage || 'MENU',
       voucherType: row.voucher_type || null,
       quantity:    row.quantity != null ? parseInt(row.quantity, 10) : null,
-      total:       row.total    != null ? String(row.total)          : null,
     };
   } catch (err) {
     console.error('[USSD] getSession error:', err.message);
@@ -81,16 +79,15 @@ async function setSession(sessionId, data) {
   try {
     await ensureTable();
     await pool.query(
-      `INSERT INTO ussd_sessions (session_id, stage, voucher_type, quantity, total, updated_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
+      `INSERT INTO ussd_sessions (session_id, stage, voucher_type, quantity, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
        ON CONFLICT (session_id) DO UPDATE
-       SET stage=$2, voucher_type=$3, quantity=$4, total=$5, updated_at=NOW()`,
+       SET stage=$2, voucher_type=$3, quantity=$4, updated_at=NOW()`,
       [
         String(sessionId),
         String(data.stage),
         data.voucherType != null ? String(data.voucherType) : null,
         data.quantity    != null ? parseInt(data.quantity, 10) : null,
-        data.total       != null ? String(data.total)        : null,
       ]
     );
   } catch (err) {
@@ -218,7 +215,6 @@ export default async function handler(req, res) {
           stage:       'CONFIRM',
           voucherType: session.voucherType,
           quantity:    qty,
-          total,
         });
         return respond(
           `${qty}x ${session.voucherType} = GHS ${total}\nMoMo: ${msisdn}\n\n1. Confirm & Pay\n2. Cancel`,
@@ -232,7 +228,7 @@ export default async function handler(req, res) {
 
         const voucherType = session.voucherType ? String(session.voucherType) : null;
         const quantity    = session.quantity    ? parseInt(session.quantity, 10) : 0;
-        const total       = session.total       ? String(session.total) : '0';
+        const total       = (parseFloat(prices[voucherType] || 0) * quantity).toFixed(2);
 
         if (!voucherType || !quantity) {
           console.error('[USSD] CONFIRM: missing session data', JSON.stringify(session));
