@@ -1,316 +1,336 @@
-// POST /api/ussd — Moolre USSD callback handler with DB-backed sessions
-//
-// ROOT CAUSE FIX: bodyParser is disabled and body is parsed manually.
-// Moolre sends USSD requests as application/x-www-form-urlencoded, but
-// Next.js's default body parser only handles that if Content-Type is set
-// correctly. Manual parsing handles JSON, form-encoded, and anything else.
-//
-// MOOLRE FIELDS:
-//   sessionId  — unique session ID (persists across interaction)
-//   new        — true / "true" on first request
-//   msisdn     — customer phone e.g. "233241235993"
-//   message    — what the user typed (empty string on first request)
-//
-// RESPONSE: { message: string, reply: boolean }
+/**
+ * USSD callback handler — implements the state machine.
+ *
+ * Moolre sends POST requests with:
+ *   { sessionId, new, msisdn, network, message, extension, data }
+ *
+ * We reply within ~2 seconds with:
+ *   { message: "...", reply: true }   ← keeps session open
+ *   { message: "...", reply: false }  ← ends session
+ *
+ * State machine stages:
+ *   WELCOME         → greeting + main menu
+ *   SELECT_NETWORK  → choose MTN / AirtelTigo / Telecel
+ *   SELECT_PLAN     → paginated plan list
+ *   ENTER_RECIPIENT → type number or press 0 for own number
+ *   CONFIRM         → show order summary, confirm or cancel
+ *   (end)           → payment initiated; session closed
+ */
 
-import pool from '../../lib/db';
-import { getPrices } from '../../lib/settings';
-import { sendAdminAlert } from '../../lib/alerts';
+const session  = require('../session');
+const datadash = require('../services/datadash');
+const moolre   = require('../services/moolre');
+const store    = require('../store');    // file-backed pending orders
+const config   = require('../config');
 
-// CRITICAL: disable Next.js body parser so we can handle any content-type
-export const config = { api: { bodyParser: false } };
+// ─── Response helpers ─────────────────────────────────────────────────────────
 
-async function parseBody(req) {
-  return new Promise((resolve) => {
-    let raw = '';
-    req.on('data', (chunk) => { raw += chunk.toString(); });
-    req.on('end', () => {
-      if (!raw) return resolve({});
-      // Try JSON
-      try { return resolve(JSON.parse(raw)); } catch (_) {}
-      // Try form-encoded
-      try {
-        const obj = {};
-        new URLSearchParams(raw).forEach((v, k) => { obj[k] = v; });
-        if (Object.keys(obj).length > 0) return resolve(obj);
-      } catch (_) {}
-      console.warn('[USSD] Could not parse body:', raw.slice(0, 200));
-      return resolve({});
+function reply(res, message, keepOpen = true) {
+  return res.json({ message: message.slice(0, 182), reply: keepOpen });
+}
+
+function end(res, message) {
+  return reply(res, message, false);
+}
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+function makeRef(msisdn) {
+  return `DTHUB-${String(msisdn).slice(-6)}-${Date.now()}`;
+}
+
+function formatPlan(plan) {
+  const allowance = plan.allowance ? `${plan.allowance} ` : '';
+  const validity  = plan.validity  ? `${plan.validity} `  : '';
+  return `${allowance}${validity}GHS${plan.price.toFixed(2)}`.trim();
+}
+
+function buildPlanPage(plans, page) {
+  const perPage  = config.PLANS_PER_PAGE;
+  const start    = page * perPage;
+  const slice    = plans.slice(start, start + perPage);
+  const hasNext  = start + perPage < plans.length;
+  const hasPrev  = page > 0;
+
+  let msg = 'Select plan:\n';
+  slice.forEach((p, i) => { msg += `${i + 1}. ${formatPlan(p)}\n`; });
+  if (hasNext) msg += '9. Next page\n';
+  if (hasPrev) msg += '8. Prev page\n';
+  msg += '0. Back';
+
+  return { msg, slice, hasNext, hasPrev };
+}
+
+function mainMenu(serviceName) {
+  return `Welcome to ${serviceName}\n1. Buy Data\n2. My Balance\n0. Exit`;
+}
+
+// ─── Main handler ─────────────────────────────────────────────────────────────
+
+async function handleUssd(req, res) {
+  // Guard: Moolre request body may be missing fields
+  const {
+    sessionId,
+    new: isNew,
+    msisdn,
+    network,
+    message: input,
+  } = req.body || {};
+
+  if (!sessionId || !msisdn) {
+    console.warn('[USSD] Received request with missing sessionId or msisdn:', req.body);
+    return end(res, 'Service error. Please dial again.');
+  }
+
+  // ── NEW SESSION ─────────────────────────────────────────────────────────────
+  if (isNew) {
+    await session.set(sessionId, {
+      stage:           'WELCOME',
+      msisdn:          String(msisdn),
+      network:         parseInt(network, 10) || 0,
+      planPage:        0,
+      selectedNetwork: null,
+      selectedPlan:    null,
+      recipient:       null,
     });
-    req.on('error', () => resolve({}));
-  });
-}
-
-// ── DB session helpers ──────────────────────────────────────────────────────
-
-async function ensureTable() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS ussd_sessions (
-      session_id   VARCHAR(100) PRIMARY KEY,
-      stage        VARCHAR(50)  NOT NULL DEFAULT 'MENU',
-      voucher_type VARCHAR(50),
-      quantity     INTEGER,
-      updated_at   TIMESTAMP DEFAULT NOW()
-    )
-  `);
-}
-
-async function getSession(sessionId) {
-  try {
-    await ensureTable();
-    const r = await pool.query(
-      'SELECT stage, voucher_type, quantity FROM ussd_sessions WHERE session_id = $1',
-      [String(sessionId)]
-    );
-    if (r.rows.length === 0) return null; // null = no session row = new session
-    const row = r.rows[0];
-    return {
-      stage:       row.stage || 'MENU',
-      voucherType: row.voucher_type || null,
-      quantity:    row.quantity != null ? parseInt(row.quantity, 10) : null,
-    };
-  } catch (err) {
-    console.error('[USSD] getSession error:', err.message);
-    return { stage: 'MENU' };
-  }
-}
-
-async function setSession(sessionId, data) {
-  try {
-    await ensureTable();
-    await pool.query(
-      `INSERT INTO ussd_sessions (session_id, stage, voucher_type, quantity, updated_at)
-       VALUES ($1, $2, $3, $4, NOW())
-       ON CONFLICT (session_id) DO UPDATE
-       SET stage=$2, voucher_type=$3, quantity=$4, updated_at=NOW()`,
-      [
-        String(sessionId),
-        String(data.stage),
-        data.voucherType != null ? String(data.voucherType) : null,
-        data.quantity    != null ? parseInt(data.quantity, 10) : null,
-      ]
-    );
-  } catch (err) {
-    console.error('[USSD] setSession error:', err.message);
-  }
-}
-
-async function clearSession(sessionId) {
-  try {
-    await pool.query('DELETE FROM ussd_sessions WHERE session_id = $1', [String(sessionId)]);
-  } catch (err) {
-    console.error('[USSD] clearSession error:', err.message);
-  }
-}
-
-// ── Main handler ─────────────────────────────────────────────────────────────
-
-export default async function handler(req, res) {
-  // Gateways often ping GET to validate the URL
-  if (req.method === 'GET') return res.status(200).json({ status: 'ok' });
-  if (req.method !== 'POST') return res.status(405).end();
-
-  // Parse body manually — works for JSON, form-encoded, or any content-type
-  let body = {};
-  try {
-    body = await parseBody(req);
-  } catch (err) {
-    console.error('[USSD] parseBody error:', err.message);
+    return reply(res, mainMenu(config.SERVICE_NAME));
   }
 
-  console.log('[USSD] body:', JSON.stringify(body));
-
-  // Safely extract and coerce every field — never trust undefined
-  const sessionId = body.sessionId   != null ? String(body.sessionId).trim()   :
-                    body.session_id  != null ? String(body.session_id).trim()  :
-                    body.SessionId   != null ? String(body.SessionId).trim()   : '';
-
-  const msisdn    = body.msisdn      != null ? String(body.msisdn).trim()      :
-                    body.phone       != null ? String(body.phone).trim()       :
-                    body.PhoneNumber != null ? String(body.PhoneNumber).trim() : '';
-
-  // isNew: Moolre may send boolean true, integer 1, or strings "true"/"1"
-  const isNewFlag =
-    body.new   === true || body.new   === 'true' || body.new   === 1 || body.new   === '1' ||
-    body.isNew === true || body.isNew === 'true' || body.isNew === 1 || body.isNew === '1';
-
-  // Moolre sends accumulated USSD string like "1*2*1" — only want the LAST segment
-  const rawMsg    = body.message ?? body.input ?? body.userInput ?? '';
-  const userInput = rawMsg != null && String(rawMsg).includes('*')
-    ? String(rawMsg).split('*').pop().trim()
-    : String(rawMsg ?? '').trim();
-
-  // isNew = flag says so (any truthy form) OR no session row in DB (checked below)
-  const isNew = isNewFlag;
-
-  console.log(`[USSD] sessionId="${sessionId}" isNew=${isNew} msisdn="${msisdn}" input="${userInput}"`);
-
-  if (!sessionId) {
-    console.error('[USSD] Missing sessionId in body:', JSON.stringify(body));
-    return res.status(200).json({ message: 'Session error. Please try again.', reply: false });
+  // ── CONTINUING SESSION ──────────────────────────────────────────────────────
+  const sess = await session.get(sessionId);
+  if (!sess) {
+    return end(res, 'Session expired. Please dial again.');
   }
 
-  const respond = async (message, keepOpen = true) => {
-    if (!keepOpen) await clearSession(sessionId);
-    console.log(`[USSD] reply=${keepOpen}: ${String(message).replace(/\n/g, '|').slice(0, 80)}`);
-    return res.status(200).json({ message, reply: keepOpen });
-  };
+  const choice = String(input || '').trim();
 
   try {
-    const prices = await getPrices();
+    switch (sess.stage) {
 
-    // ── New session → show main menu ─────────────────────────────────────
-    // Look up DB — null means no row exists yet (genuinely first request)
-    const existingSession = await getSession(sessionId);
+      // ── WELCOME ─────────────────────────────────────────────────────────────
+      case 'WELCOME': {
+        if (choice === '0') return end(res, 'Thank you. Goodbye!');
 
-    // Treat as new if flag says so OR no DB record found
-    const isNewSession = isNew || existingSession === null;
-
-    console.log(`[USSD] isNewSession=${isNewSession} existingStage=${existingSession?.stage ?? 'none'}`);
-
-    if (isNewSession) {
-      await setSession(sessionId, { stage: 'MENU' });
-      return respond(
-        `Welcome to WAEC GH Checkers\n` +
-        `1. WASSCE (GHS ${prices.WASSCE})\n` +
-        `2. BECE (GHS ${prices.BECE})\n` +
-        `3. CSSPS (GHS ${prices.CSSPS})\n` +
-        `0. Exit`,
-        true
-      );
-    }
-
-    const session = existingSession;
-    const choice  = userInput;
-
-    console.log(`[USSD] stage="${session.stage}" choice="${choice}"`);
-
-    switch (session.stage) {
-
-      case 'MENU': {
-        const typeMap = { '1': 'WASSCE', '2': 'BECE', '3': 'CSSPS' };
-        if (choice === '0') return respond('Thank you. Goodbye!', false);
-        if (!typeMap[choice]) {
-          return respond(
-            `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. CSSPS (GHS ${prices.CSSPS})\n0. Exit`,
-            true
-          );
-        }
-        const voucherType = typeMap[choice];
-        await setSession(sessionId, { stage: 'SELECT_QTY', voucherType });
-        return respond(
-          `${voucherType} @ GHS ${prices[voucherType]} each.\nHow many? (1-5)`,
-          true
-        );
-      }
-
-      case 'SELECT_QTY': {
-        const qty = parseInt(choice, 10);
-        if (!qty || qty < 1 || qty > 5) {
-          return respond('Please enter a number between 1 and 5:', true);
-        }
-        const unitPrice = parseFloat(prices[String(session.voucherType)] || 0);
-        const total     = (unitPrice * qty).toFixed(2);
-        await setSession(sessionId, {
-          stage:       'CONFIRM',
-          voucherType: session.voucherType,
-          quantity:    qty,
-        });
-        return respond(
-          `${qty}x ${session.voucherType} = GHS ${total}\nMoMo: ${msisdn}\n\n1. Confirm & Pay\n2. Cancel`,
-          true
-        );
-      }
-
-      case 'CONFIRM': {
-        if (choice === '2') return respond('Cancelled. Goodbye!', false);
-        if (choice !== '1') return respond('Press 1 to confirm or 2 to cancel:', true);
-
-        const voucherType = session.voucherType ? String(session.voucherType) : null;
-        const quantity    = session.quantity    ? parseInt(session.quantity, 10) : 0;
-        const total       = (parseFloat(prices[voucherType] || 0) * quantity).toFixed(2);
-
-        if (!voucherType || !quantity) {
-          console.error('[USSD] CONFIRM: missing session data', JSON.stringify(session));
-          return respond('Session expired. Please dial again.', false);
+        if (choice === '2') {
+          const balance = await datadash.getWalletBalance();
+          return end(res, `${config.SERVICE_NAME} Balance:\nGHS ${balance.toFixed(2)}`);
         }
 
-        const safeSuffix = String(sessionId).replace(/\W/g, '').slice(-6).toUpperCase() || 'USSD';
-        const ref = `USSD-${Date.now()}-${safeSuffix}`;
-
-        const client = await pool.connect();
-        try {
-          await client.query('BEGIN');
-
-          const available = await client.query(
-            `SELECT id, serial, pin FROM vouchers
-             WHERE type = $1 AND status = 'available'
-             ORDER BY id ASC LIMIT $2
-             FOR UPDATE SKIP LOCKED`,
-            [voucherType, quantity]
-          );
-
-          if (available.rows.length >= quantity) {
-            const ids = available.rows.map(v => v.id);
-            await client.query(
-              `UPDATE vouchers
-               SET status='sold', sold_to=$1, transaction_ref=$2, sold_at=NOW()
-               WHERE id=ANY($3)`,
-              [msisdn, ref, ids]
-            );
-            await client.query(
-              `INSERT INTO transactions
-                 (reference, phone, amount, quantity, voucher_type, status, created_at)
-               VALUES ($1,$2,$3,$4,$5,'pending',NOW())
-               ON CONFLICT (reference) DO NOTHING`,
-              [ref, msisdn, parseFloat(total), quantity, voucherType]
-            );
-          } else {
-            await client.query(
-              `INSERT INTO preorders
-                 (reference, phone, name, amount, quantity, voucher_type, status, created_at)
-               VALUES ($1,$2,'',$3,$4,$5,'pending',NOW())
-               ON CONFLICT (reference) DO NOTHING`,
-              [ref, msisdn, parseFloat(total), quantity, voucherType]
-            );
-            await client.query(
-              `INSERT INTO transactions
-                 (reference, phone, amount, quantity, voucher_type, status, created_at)
-               VALUES ($1,$2,$3,$4,$5,'preorder',NOW())
-               ON CONFLICT (reference) DO NOTHING`,
-              [ref, msisdn, parseFloat(total), quantity, voucherType]
-            );
-            await sendAdminAlert(
-              `USSD Preorder: ${voucherType} x${quantity} GHS ${total} from ${msisdn}. Ref: ${ref}`
-            );
+        if (choice === '1') {
+          let networks;
+          try {
+            networks = await datadash.getNetworks();
+          } catch (err) {
+            console.error('[USSD] Failed to load networks:', err.message);
+            return end(res, 'Service unavailable. Please try again in a few minutes.');
           }
 
-          await client.query('COMMIT');
-          client.release();
+          if (networks.length === 0) {
+            return end(res, 'No plans available at this time. Try again later.');
+          }
 
-          return respond(
-            `Order confirmed!\nGHS ${total} will be deducted from your MoMo.\nVouchers sent via SMS after payment.\nRef: ${ref.slice(-8)}`,
-            false
-          );
+          await session.update(sessionId, { stage: 'SELECT_NETWORK', availableNetworks: networks });
 
-        } catch (err) {
-          await client.query('ROLLBACK');
-          client.release();
-          console.error('[USSD] CONFIRM DB error:', err.message);
-          return respond('An error occurred. Please try again.', false);
+          let msg = 'Select network:\n';
+          networks.forEach((n, i) => { msg += `${i + 1}. ${n}\n`; });
+          msg += '0. Back';
+          return reply(res, msg);
         }
+
+        // Invalid
+        return reply(res, `Invalid option.\n${mainMenu(config.SERVICE_NAME)}`);
+      }
+
+      // ── SELECT NETWORK ───────────────────────────────────────────────────────
+      case 'SELECT_NETWORK': {
+        const networks = sess.availableNetworks || [];
+
+        if (choice === '0') {
+          await session.update(sessionId, { stage: 'WELCOME' });
+          return reply(res, mainMenu(config.SERVICE_NAME));
+        }
+
+        const idx = parseInt(choice, 10) - 1;
+        if (isNaN(idx) || idx < 0 || idx >= networks.length) {
+          let msg = 'Invalid. Select network:\n';
+          networks.forEach((n, i) => { msg += `${i + 1}. ${n}\n`; });
+          msg += '0. Back';
+          return reply(res, msg);
+        }
+
+        const selectedNetwork = networks[idx];
+        let plans;
+        try {
+          plans = await datadash.getPlansByNetwork(selectedNetwork);
+        } catch (err) {
+          console.error('[USSD] Failed to load plans:', err.message);
+          return end(res, 'Could not load plans. Please try again.');
+        }
+
+        if (plans.length === 0) {
+          let msg = `No plans for ${selectedNetwork}.\nSelect network:\n`;
+          networks.forEach((n, i) => { msg += `${i + 1}. ${n}\n`; });
+          msg += '0. Back';
+          return reply(res, msg);
+        }
+
+        await session.update(sessionId, { stage: 'SELECT_PLAN', selectedNetwork, networkPlans: plans, planPage: 0 });
+        return reply(res, buildPlanPage(plans, 0).msg);
+      }
+
+      // ── SELECT PLAN ──────────────────────────────────────────────────────────
+      case 'SELECT_PLAN': {
+        const plans = sess.networkPlans || [];
+        const page  = sess.planPage || 0;
+
+        if (choice === '0') {
+          await session.update(sessionId, { stage: 'SELECT_NETWORK' });
+          const networks = sess.availableNetworks || [];
+          let msg = 'Select network:\n';
+          networks.forEach((n, i) => { msg += `${i + 1}. ${n}\n`; });
+          msg += '0. Back';
+          return reply(res, msg);
+        }
+
+        const { slice, hasNext, hasPrev } = buildPlanPage(plans, page);
+
+        if (choice === '9' && hasNext) {
+          const p = page + 1;
+          await session.update(sessionId, { planPage: p });
+          return reply(res, buildPlanPage(plans, p).msg);
+        }
+
+        if (choice === '8' && hasPrev) {
+          const p = page - 1;
+          await session.update(sessionId, { planPage: p });
+          return reply(res, buildPlanPage(plans, p).msg);
+        }
+
+        const planIdx = parseInt(choice, 10) - 1;
+        if (isNaN(planIdx) || planIdx < 0 || planIdx >= slice.length) {
+          return reply(res, `Invalid option.\n${buildPlanPage(plans, page).msg}`);
+        }
+
+        const selectedPlan = slice[planIdx];
+        await session.update(sessionId, { stage: 'ENTER_RECIPIENT', selectedPlan });
+
+        return reply(
+          res,
+          `${formatPlan(selectedPlan)}\n\nEnter recipient number\nor press 0 for your own number:`
+        );
+      }
+
+      // ── ENTER RECIPIENT ──────────────────────────────────────────────────────
+      case 'ENTER_RECIPIENT': {
+        let recipient;
+
+        if (choice === '0') {
+          recipient = sess.msisdn;
+        } else if (/^0\d{9}$/.test(choice)) {
+          recipient = choice;
+        } else if (/^\d{9}$/.test(choice)) {
+          recipient = '0' + choice;
+        } else {
+          return reply(res, 'Invalid number. Enter 10-digit\nnumber (e.g. 0541234567)\nor press 0 for your own number:');
+        }
+
+        await session.update(sessionId, { stage: 'CONFIRM', recipient });
+
+        const plan = sess.selectedPlan;
+        return reply(
+          res,
+          `Confirm Order:\n` +
+          `Plan: ${formatPlan(plan)}\n` +
+          `For:  ${recipient}\n` +
+          `Cost: GHS${plan.price.toFixed(2)}\n\n` +
+          `1. Confirm\n0. Cancel`
+        );
+      }
+
+      // ── CONFIRM ──────────────────────────────────────────────────────────────
+      case 'CONFIRM': {
+        if (choice === '0') {
+          await session.update(sessionId, { stage: 'WELCOME' });
+          return reply(res, `Cancelled.\n\n${mainMenu(config.SERVICE_NAME)}`);
+        }
+
+        if (choice !== '1') {
+          const plan = sess.selectedPlan;
+          return reply(
+            res,
+            `Confirm Order:\n` +
+            `Plan: ${formatPlan(plan)}\n` +
+            `For:  ${sess.recipient}\n` +
+            `Cost: GHS${plan.price.toFixed(2)}\n\n` +
+            `1. Confirm\n0. Cancel`
+          );
+        }
+
+        // ── Initiate payment ─────────────────────────────────────────────────
+        const plan        = sess.selectedPlan;
+        const externalRef = makeRef(sess.msisdn);
+
+        // Save order to Redis BEFORE calling Moolre — ensures the record exists
+        // even if the webhook fires before initiatePayment returns.
+        await store.set(externalRef, {
+          planId:    plan.id,
+          recipient: sess.recipient,
+          amount:    plan.price,
+          msisdn:    sess.msisdn,
+          planName:  plan.name,
+        });
+
+        await session.update(sessionId, { stage: 'PROCESSING', externalRef });
+
+        console.log(`[USSD] Initiating payment: ref=${externalRef} network=${sess.network}→channel=${config.NETWORK_TO_CHANNEL[sess.network]} amount=${plan.price}`);
+
+        let paymentResponse;
+        try {
+          paymentResponse = await moolre.initiatePayment({
+            payer:         sess.msisdn,
+            networkCode:   sess.network,
+            amount:        plan.price,
+            externalRef,
+            ussdSessionId: sessionId,
+            reference:     `${plan.name} → ${sess.recipient}`,
+          });
+        } catch (err) {
+          console.error(`[USSD] Payment initiation error for ${externalRef}:`, err.message);
+          await store.remove(externalRef);
+          return end(res, 'Payment service error. Please try again.\n\nNo charge was made.');
+        }
+
+        // If Moolre rejected the request, clean up and tell the user
+        if (!paymentResponse.ok) {
+          const reason = paymentResponse.raw?.message || 'Request declined';
+          console.warn(`[USSD] Payment rejected for ${externalRef}: status=${paymentResponse.statusCode} reason="${reason}"`);
+          await store.remove(externalRef);
+          return end(res, `Payment declined: ${reason}\n\nNo charge was made.`);
+        }
+
+        // Success — payment prompt is on the customer's phone
+        const networkName = config.NETWORK_NAMES[sess.network] || 'your network';
+        return end(
+          res,
+          `GHS${plan.price.toFixed(2)} payment requested.\n` +
+          `Approve the ${networkName} prompt to get your data.\n\n` +
+          `Ref: ${externalRef}`
+        );
+      }
+
+      // ── PROCESSING ───────────────────────────────────────────────────────────
+      case 'PROCESSING': {
+        return end(res, 'Your order is being processed. You will receive your bundle shortly.');
       }
 
       default:
-        await setSession(sessionId, { stage: 'MENU' });
-        return respond(
-          `WAEC GH Checkers\n1. WASSCE\n2. BECE\n3. CSSPS\n0. Exit`,
-          true
-        );
+        return end(res, 'An error occurred. Please dial again.');
     }
 
   } catch (err) {
-    console.error('[USSD] Unhandled error:', err.message, err.stack);
-    return res.status(200).json({ message: 'Service error. Please try again.', reply: false });
+    console.error('[USSD] Unhandled error in stage', sess?.stage, ':', err.message);
+    return end(res, 'Service error. Please try again later.');
   }
 }
+
+module.exports = { handleUssd };
