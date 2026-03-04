@@ -288,45 +288,10 @@ export default async function handler(req, res) {
           await client.query('COMMIT');
           client.release();
 
-          // Trigger Moolre MoMo collection — this sends the actual payment prompt to the user's phone
-          try {
-            const MOOLRE_API_BASE = process.env.MOOLRE_API_BASE || 'https://api.moolre.com/v2';
-            const collectRes = await fetch(`${MOOLRE_API_BASE}/collect`, {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${process.env.MOOLRE_SECRET_KEY}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                publicKey:     process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
-                accountNumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
-                amount:        parseFloat(total),
-                currency:      'GHS',
-                reference:     ref,
-                customerName:  msisdn,
-                customerPhone: msisdn,
-                description:   `${quantity}x ${voucherType} Voucher - WAEC GH Checkers`,
-                callbackUrl:   `${process.env.NEXT_PUBLIC_BASE_URL}/api/moolre-webhook`,
-              }),
-            });
-            const collectData = await collectRes.json();
-            console.log('[USSD] Moolre collect response:', JSON.stringify(collectData));
-
-            if (!collectRes.ok || collectData.status === false || collectData.status === 0) {
-              console.error('[USSD] Moolre collect failed:', JSON.stringify(collectData));
-              // Don't end session — tell user there was a payment issue
-              return respond(
-                `Payment request failed.\n${collectData.message || 'Please try again or contact support.'}\nRef: ${ref.slice(-8)}`,
-                false
-              );
-            }
-          } catch (collectErr) {
-            console.error('[USSD] Moolre collect error:', collectErr.message);
-            return respond('Payment request could not be sent. Please contact support.', false);
-          }
-
+          // Moolre handles the MoMo PIN prompt automatically within their USSD session
+          // after we return reply:false. The webhook fires when payment completes.
           return respond(
-            `Check your phone!\nApprove the GHS ${total} MoMo prompt.\nVouchers sent via SMS after payment.\nRef: ${ref.slice(-8)}`,
+            `Confirm GHS ${total} payment\nfrom ${msisdn}?\nEnter MoMo PIN to pay.\nRef: ${ref.slice(-8)}`,
             false
           );
 
