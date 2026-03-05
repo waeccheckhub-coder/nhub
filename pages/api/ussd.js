@@ -288,10 +288,48 @@ export default async function handler(req, res) {
           await client.query('COMMIT');
           client.release();
 
-          // Moolre handles the MoMo PIN prompt automatically within their USSD session
-          // after we return reply:false. The webhook fires when payment completes.
+          // Moolre has no push debit API — payment is customer-initiated via web POS.
+          // Generate a payment link and SMS it to the customer so they can pay.
+          try {
+            const baseUrl = process.env.NEXT_PUBLIC_BASE_URL;
+            const linkRes = await fetch('https://api.moolre.com/embed/link', {
+              method: 'POST',
+              headers: {
+                'X-API-USER':   process.env.MOOLRE_USERNAME,
+                'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                type:          1,
+                amount:        parseFloat(total).toFixed(2),
+                email:         'customer@waecghcheckers.com',
+                externalref:   ref,
+                callback:      `${baseUrl}/api/moolre-webhook`,
+                redirect:      `${baseUrl}/thank-you?ref=${ref}`,
+                reusable:      '0',
+                currency:      'GHS',
+                accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+                metadata:      { phone: msisdn, quantity: String(quantity), voucher_type: voucherType },
+              }),
+            });
+            const linkData = await linkRes.json();
+            console.log('[USSD] Moolre link response:', JSON.stringify(linkData));
+
+            if (linkData.status === 1 && linkData.data?.authorization_url) {
+              const { sendSMS } = await import('../../lib/sms.js');
+              await sendSMS(
+                msisdn,
+                `WAEC GH: Pay GHS ${total} for ${quantity}x ${voucherType}: ${linkData.data.authorization_url} Ref: ${ref.slice(-8)}`
+              );
+            } else {
+              console.error('[USSD] Moolre link failed:', JSON.stringify(linkData));
+            }
+          } catch (linkErr) {
+            console.error('[USSD] Payment link error:', linkErr.message);
+          }
+
           return respond(
-            `Confirm GHS ${total} payment\nfrom ${msisdn}?\nEnter MoMo PIN to pay.\nRef: ${ref.slice(-8)}`,
+            `Order saved! Ref: ${ref.slice(-8)}\nA payment link has been sent to your phone via SMS.\nPay to receive your vouchers.`,
             false
           );
 
