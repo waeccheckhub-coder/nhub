@@ -295,6 +295,13 @@ export default async function handler(req, res) {
           const networkToChannel = { 3: '13', 5: '7', 6: '6' };
           const channel = networkToChannel[network] || '13';
 
+          // Moolre payment API requires local format: 0XXXXXXXXX (no country code)
+          const payerLocal = msisdn.startsWith('233')
+            ? '0' + msisdn.slice(3)
+            : msisdn.startsWith('+233')
+            ? '0' + msisdn.slice(4)
+            : msisdn;
+
           // Trigger direct MoMo PIN prompt to customer's phone.
           // Pass sessionId to skip OTP (documented in Moolre voting guide).
           // Fire-and-forget: end USSD session immediately so the prompt appears.
@@ -309,7 +316,7 @@ export default async function handler(req, res) {
               type:          1,
               channel,
               currency:      'GHS',
-              payer:         msisdn,
+              payer:         payerLocal,
               amount:        parseFloat(total),
               externalref:   ref,
               reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
