@@ -129,6 +129,8 @@ export default async function handler(req, res) {
                     body.phone       != null ? String(body.phone).trim()       :
                     body.PhoneNumber != null ? String(body.PhoneNumber).trim() : '';
 
+  const network   = body.network != null ? parseInt(body.network, 10) : 3; // 3=MTN default
+
   // isNew: Moolre may send boolean true, integer 1, or strings "true"/"1"
   const isNewFlag =
     body.new   === true || body.new   === 'true' || body.new   === 1 || body.new   === '1' ||
@@ -288,48 +290,39 @@ export default async function handler(req, res) {
           await client.query('COMMIT');
           client.release();
 
-          // Moolre has no push debit API — payment is customer-initiated via web POS.
-          // Generate a payment link and SMS it to the customer so they can pay.
-          try {
-            const baseUrl = process.env.NEXT_PUBLIC_BASE_URL;
-            const linkRes = await fetch('https://api.moolre.com/embed/link', {
-              method: 'POST',
-              headers: {
-                'X-API-USER':   process.env.MOOLRE_USERNAME,
-                'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                type:          1,
-                amount:        parseFloat(total).toFixed(2),
-                email:         'customer@waecghcheckers.com',
-                externalref:   ref,
-                callback:      `${baseUrl}/api/moolre-webhook`,
-                redirect:      `${baseUrl}/thank-you?ref=${ref}`,
-                reusable:      '0',
-                currency:      'GHS',
-                accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
-                metadata:      { phone: msisdn, quantity: String(quantity), voucher_type: voucherType },
-              }),
-            });
-            const linkData = await linkRes.json();
-            console.log('[USSD] Moolre link response:', JSON.stringify(linkData));
+          // Map USSD network integer to Moolre payment channel
+          // USSD: 3=MTN, 5=AT, 6=Telecel → Payment: 13=MTN, 7=AT, 6=Telecel
+          const networkToChannel = { 3: '13', 5: '7', 6: '6' };
+          const channel = networkToChannel[network] || '13';
 
-            if (linkData.status === 1 && linkData.data?.authorization_url) {
-              const { sendSMS } = await import('../../lib/sms.js');
-              await sendSMS(
-                msisdn,
-                `WAEC GH: Pay GHS ${total} for ${quantity}x ${voucherType}: ${linkData.data.authorization_url} Ref: ${ref.slice(-8)}`
-              );
-            } else {
-              console.error('[USSD] Moolre link failed:', JSON.stringify(linkData));
-            }
-          } catch (linkErr) {
-            console.error('[USSD] Payment link error:', linkErr.message);
-          }
+          // Trigger direct MoMo PIN prompt to customer's phone.
+          // Pass sessionId to skip OTP (documented in Moolre voting guide).
+          // Fire-and-forget: end USSD session immediately so the prompt appears.
+          fetch('https://api.moolre.com/open/transact/payment', {
+            method: 'POST',
+            headers: {
+              'X-API-USER':   process.env.MOOLRE_USERNAME,
+              'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              type:          1,
+              channel,
+              currency:      'GHS',
+              payer:         msisdn,
+              amount:        parseFloat(total),
+              externalref:   ref,
+              reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
+              sessionid:     sessionId,
+              accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+            }),
+          })
+            .then(r => r.json())
+            .then(d => console.log('[USSD] Moolre payment response:', JSON.stringify(d)))
+            .catch(e => console.error('[USSD] Moolre payment error:', e.message));
 
           return respond(
-            `Order saved! Ref: ${ref.slice(-8)}\nA payment link has been sent to your phone via SMS.\nPay to receive your vouchers.`,
+            `Please authorize the GHS ${total} payment prompt on your phone to receive your ${quantity}x ${voucherType} voucher(s).`,
             false
           );
 
