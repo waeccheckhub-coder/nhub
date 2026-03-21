@@ -38,22 +38,36 @@ export default async function handler(req, res) {
       `SELECT id FROM transactions WHERE reference=$1 AND status='success'`, [reference]
     );
     if (existing.rowCount > 0) {
+      console.log('[Webhook] Already processed:', reference);
       return res.status(200).json({ received: true, note: 'Already processed' });
     }
 
     // ── LOAD ORDER ─────────────────────────────────────────────────────────
+    // Check preorders first, then fall back to transactions table
+    // (USSD flow saves to transactions only, not preorders)
+    let phone, qty, voucherType, orderAmount;
+
     const preorderRow = await db.query(
       `SELECT phone, quantity, voucher_type, amount FROM preorders WHERE reference=$1`, [reference]
     );
 
-    let phone, qty, voucherType, orderAmount;
     if (preorderRow.rowCount > 0) {
       ({ phone, quantity: qty, voucher_type: voucherType, amount: orderAmount } = preorderRow.rows[0]);
+      console.log('[Webhook] Order found in preorders:', { phone, qty, voucherType });
     } else {
-      phone = payer || '';
-      qty = 1;
-      voucherType = null;
-      orderAmount = amount || 0;
+      // Fall back to transactions table (used by USSD flow)
+      const txRow = await db.query(
+        `SELECT phone, quantity, voucher_type, amount FROM transactions WHERE reference=$1`, [reference]
+      );
+      if (txRow.rowCount > 0) {
+        ({ phone, quantity: qty, voucher_type: voucherType, amount: orderAmount } = txRow.rows[0]);
+        console.log('[Webhook] Order found in transactions:', { phone, qty, voucherType });
+      } else {
+        phone = payer || '';
+        qty = 1;
+        voucherType = null;
+        orderAmount = amount || 0;
+      }
     }
 
     if (!voucherType) {
@@ -66,11 +80,37 @@ export default async function handler(req, res) {
 
     qty = parseInt(qty);
 
-    // ── ASSIGN VOUCHERS ────────────────────────────────────────────────────
+    // ── ASSIGN / CONFIRM VOUCHERS ──────────────────────────────────────────
     const client = await db.connect();
     try {
       await client.query('BEGIN');
 
+      // Check if vouchers were already pre-assigned by the USSD handler
+      // (USSD marks vouchers 'sold' with transaction_ref before payment completes)
+      const preAssigned = await client.query(
+        `SELECT id, serial, pin FROM vouchers
+         WHERE transaction_ref=$1 AND status='sold'`,
+        [reference]
+      );
+
+      if (preAssigned.rowCount >= qty) {
+        // Vouchers already assigned — just mark transaction success and send SMS
+        console.log('[Webhook] Vouchers pre-assigned by USSD, confirming payment');
+        await client.query(
+          `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
+           VALUES ($1,$2,$3,$4,$5,'success',NOW())
+           ON CONFLICT (reference) DO UPDATE SET status='success'`,
+          [reference, phone, parseFloat(orderAmount), qty, voucherType]
+        );
+        await client.query('COMMIT');
+        client.release();
+
+        await sendVoucherSMS(phone, preAssigned.rows, voucherType);
+        await checkAndAlertStock(voucherType);
+        return res.status(200).json({ received: true, fulfilled: true });
+      }
+
+      // No pre-assigned vouchers — try to assign fresh ones (preorder / web payment flow)
       const vouchers = await client.query(
         `SELECT id, serial, pin FROM vouchers
          WHERE type=$1 AND status='available'
@@ -79,6 +119,7 @@ export default async function handler(req, res) {
       );
 
       if (vouchers.rowCount < qty) {
+        // Out of stock
         await client.query(
           `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
            VALUES ($1,$2,'',$3,$4,$5,'pending',NOW())
