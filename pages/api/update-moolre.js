@@ -3,7 +3,7 @@
 // Visit https://yoursite.vercel.app/api/update-moolre once, then delete this file.
 
 export default async function handler(req, res) {
-  const callbackUrl = `${process.env.NEXT_PUBLIC_BASE_URL}/api/moolre-webhook`;
+  const callbackUrl = `${process.env.NEXT_PUBLIC_BASE_URL}api/moolre-webhook`;
 
   const response = await fetch('https://api.moolre.com/open/account/update', {
     method: 'POST',
