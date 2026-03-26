@@ -322,6 +322,7 @@ export default async function handler(req, res) {
               reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
               sessionid:     sessionId,
               accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+              callback:      `${process.env.NEXT_PUBLIC_BASE_URL}/api/moolre-webhook`,
             }),
           })
             .then(r => r.json())
