@@ -120,6 +120,15 @@ export default async function handler(req, res) {
 
   console.log('[USSD] body:', JSON.stringify(body));
 
+
+  // ── Payment webhook detection ─────────────────────────────────────────────
+  // Moolre uses ONE callback URL per account. If the USSD endpoint is set as
+  // the account callback, payment confirmations also arrive here.
+  if (body.data && body.data.txstatus !== undefined && body.data.externalref) {
+    console.log('[USSD] Detected payment webhook — routing to fulfillment');
+    const { default: handleWebhook } = await import('./moolre-webhook.js');
+    return handleWebhook(req, res, body);
+  }
   // Safely extract and coerce every field — never trust undefined
   const sessionId = body.sessionId   != null ? String(body.sessionId).trim()   :
                     body.session_id  != null ? String(body.session_id).trim()  :
