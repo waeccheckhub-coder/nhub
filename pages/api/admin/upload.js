@@ -2,9 +2,41 @@ import { getServerSession } from 'next-auth/next';
 import { authOptions } from '../auth/[...nextauth]';
 import db from '../../../lib/db';
 import { sendAdminAlert } from '../../../lib/alerts';
-import { sendVoucherSMS } from '../../../lib/sms';
 
-async function autoFulfillPreorders(type) {
+async function sendVoucherSMS(phone, vouchers, voucherType) {
+  // Normalise to 233XXXXXXXXX — handles 0XX, 233XX, +233XX
+  const clean = (phone || '').replace(/\s+/g, '');
+  const formattedPhone = clean.startsWith('+233') ? clean.slice(1)
+    : clean.startsWith('233') ? clean
+    : clean.startsWith('0')   ? '233' + clean.slice(1)
+    : clean;
+  const getPortalLink = (t) => {
+    const u = (t || '').toUpperCase();
+    if (u.includes('WASSCE') || u.includes('NOVDEC')) return 'https://ghana.waecdirect.org';
+    if (u.includes('BECE')) return 'https://eresults.waecgh.org';
+    if (u.includes('CSSPS') || u.includes('PLACEMENT')) return 'https://www.cssps.gov.gh';
+    return 'https://waeccardsonline.com';
+  };
+
+  const lines = vouchers.map((v, i) => `${i + 1}. S/N: ${v.serial} PIN: ${v.pin}`).join('\n');
+  const message =
+    `Your ${voucherType} checker voucher(s) are ready!\n\n` +
+    `${lines}\n\n` +
+    `Check results: ${getPortalLink(voucherType)}\n\nThank you!`;
+
+  try {
+    await fetch('https://sms.arkesel.com/api/v2/sms/send', {
+      method: 'POST',
+      headers: { 'api-key': process.env.ARKESEL_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sender: 'WAEC-GH', message, recipients: [formattedPhone] }),
+    });
+  } catch (err) {
+    console.error('SMS error for preorder fulfillment:', err.message);
+  }
+}
+
+async function autoFulfillPreorders(type, uploadedCount) {
+  // Grab pending preorders for this voucher type, oldest first
   const preorders = await db.query(
     `SELECT * FROM preorders WHERE voucher_type = $1 AND status = 'pending'
      ORDER BY created_at ASC`,
@@ -14,12 +46,15 @@ async function autoFulfillPreorders(type) {
   if (preorders.rows.length === 0) return { fulfilled: 0, stillPending: 0 };
 
   let fulfilled = 0;
+  let remainingStock = uploadedCount;
 
   for (const order of preorders.rows) {
+    if (remainingStock <= 0) break;
+    if (order.quantity > remainingStock) continue; // not enough for this order yet, skip
+
     const client = await db.connect();
     try {
-      await client.query('BEGIN');
-
+      // Grab the exact vouchers needed
       const vouchers = await client.query(
         `SELECT id, serial, pin FROM vouchers
          WHERE type = $1 AND status = 'available'
@@ -28,10 +63,7 @@ async function autoFulfillPreorders(type) {
         [type, order.quantity]
       );
 
-      if (vouchers.rows.length < order.quantity) {
-        await client.query('ROLLBACK');
-        continue;
-      }
+      if (vouchers.rows.length < order.quantity) continue; // race condition guard
 
       const ids = vouchers.rows.map(v => v.id);
 
@@ -47,21 +79,18 @@ async function autoFulfillPreorders(type) {
       );
 
       await client.query(
-        `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-         VALUES ($1, $2, $3, $4, $5, 'success', NOW())
-         ON CONFLICT (reference) DO UPDATE SET status = 'success'`,
-        [order.reference, order.phone, order.amount, order.quantity, type]
+        `UPDATE transactions SET status = 'success' WHERE reference = $1`,
+        [order.reference]
       );
 
-      await client.query('COMMIT');
-      client.release();
+      await sendVoucherSMS(order.phone, vouchers.rows, type);
 
-      await sendVoucherSMS(order.phone, vouchers.rows, type, { waitMessage: true });
+      remainingStock -= order.quantity;
       fulfilled++;
     } catch (err) {
-      await client.query('ROLLBACK');
-      client.release();
       console.error(`Auto-fulfill failed for preorder ${order.id}:`, err.message);
+    } finally {
+      client.release();
     }
   }
 
@@ -76,7 +105,7 @@ export default async function handler(req, res) {
 
   const { csvData, type } = req.body;
   if (!csvData || !type) {
-    return res.status(400).json({ error: 'Missing csvData or type' });
+    return res.status(400).json({ error: 'Missing required data: csvData or type' });
   }
 
   try {
@@ -84,7 +113,7 @@ export default async function handler(req, res) {
     const results = { success: 0, failed: 0 };
 
     for (const line of lines) {
-      const parts = line.split(',').map(s => s.trim());
+      const parts = line.split(',').map(item => item.trim());
       if (parts.length >= 2) {
         const [serial, pin] = parts;
         try {
@@ -95,8 +124,8 @@ export default async function handler(req, res) {
             [type, serial, pin]
           );
           results.success++;
-        } catch (err) {
-          console.error(`Insert error for line "${line}":`, err.message);
+        } catch (dbError) {
+          console.error(`Error inserting line: ${line}`, dbError);
           results.failed++;
         }
       } else {
@@ -104,12 +133,14 @@ export default async function handler(req, res) {
       }
     }
 
+    // Auto-fulfill any pending preorders for this voucher type
     let autoFulfill = { fulfilled: 0, stillPending: 0 };
     if (results.success > 0) {
-      autoFulfill = await autoFulfillPreorders(type);
+      autoFulfill = await autoFulfillPreorders(type, results.success);
+
       if (autoFulfill.fulfilled > 0) {
         await sendAdminAlert(
-          `AUTO-FULFILLED: ${autoFulfill.fulfilled} preorder(s) for ${type} fulfilled after upload. ${autoFulfill.stillPending} still pending.`
+          `AUTO-FULFILLED: ${autoFulfill.fulfilled} preorder(s) for ${type} were automatically fulfilled after upload. ${autoFulfill.stillPending} preorder(s) still pending.`
         );
       }
     }
@@ -121,7 +152,7 @@ export default async function handler(req, res) {
         failed: results.failed,
         preordersFulfilled: autoFulfill.fulfilled,
         preordersStillPending: autoFulfill.stillPending,
-      },
+      }
     });
 
   } catch (error) {
