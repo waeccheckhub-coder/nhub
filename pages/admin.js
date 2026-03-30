@@ -11,7 +11,7 @@ import {
   Search, RefreshCw, Printer, Download, Menu, X,
   CheckCircle, Clock, AlertCircle, ChevronLeft, ChevronRight,
   Phone, DollarSign, TrendingUp, ShieldCheck, Eye, EyeOff, Send,
-  Check, Edit3, Save,
+  Check, Edit3, Save, MessageSquare, Users, AlertTriangle,
 } from 'lucide-react';
 
 const TABS = [
@@ -20,6 +20,7 @@ const TABS = [
   { id: 'transactions', label: 'Transactions', icon: Receipt },
   { id: 'preorders', label: 'Pre-Orders', icon: ClipboardList },
   { id: 'settings', label: 'Settings', icon: Settings },
+  { id: 'sms', label: 'SMS Center', icon: MessageSquare },
 ];
 
 const TYPES = ['WASSCE', 'BECE', 'CSSPS'];
@@ -98,6 +99,12 @@ export default function Admin() {
   const [settingsDraft, setSettingsDraft] = useState({});
   const [settingsLoading, setSettingsLoading] = useState(false);
 
+  const [smsMessage, setSmsMessage] = useState('');
+  const [smsAudience, setSmsAudience] = useState('all');
+  const [smsVoucherType, setSmsVoucherType] = useState('WASSCE');
+  const [smsCustomNumbers, setSmsCustomNumbers] = useState('');
+  const [smsSending, setSmsSending] = useState(false);
+  const [smsResult, setSmsResult] = useState(null);
   const [resending, setResending] = useState(null);
 
   const [inputMode, setInputMode] = useState('manual');
@@ -125,6 +132,27 @@ export default function Admin() {
     try { await axios.put('/api/admin/settings', { settings: settingsDraft }); setSettings(settingsDraft); setSettingsEditing(false); toast.success('Settings saved!'); }
     catch (e) { toast.error('Failed to save settings'); }
     setSettingsLoading(false);
+  };
+
+  const sendBulkSMS = async (e) => {
+    e.preventDefault();
+    if (!smsMessage.trim()) return toast.error('Message is required');
+    if (!confirm(`Send SMS to ${smsAudience === 'custom' ? 'custom list' : smsAudience === 'all' ? 'ALL customers' : smsVoucherType + ' customers'}?\n\nMessage: ${smsMessage}`)) return;
+    setSmsSending(true);
+    setSmsResult(null);
+    try {
+      const res = await axios.post('/api/admin/sms-center', {
+        message: smsMessage,
+        audience: smsAudience,
+        voucherType: smsVoucherType,
+        customNumbers: smsCustomNumbers,
+      });
+      setSmsResult(res.data);
+      toast.success(`SMS sent to ${res.data.sent} recipients!`);
+    } catch (e) {
+      toast.error(e?.response?.data?.error || 'Failed to send SMS');
+    }
+    setSmsSending(false);
   };
 
   const resendSMS = async (reference, phone) => {
@@ -637,13 +665,13 @@ export default function Admin() {
                       <span>{new Date(tx.created_at).toLocaleDateString()}</span>
                     </div>
                     <p className="font-mono text-[9px] text-black/30 mt-1 truncate">{tx.reference}</p>
-                      {tx.status === "success" && (
-                        <button onClick={() => resendSMS(tx.reference, tx.phone)}
-                          disabled={resending === tx.reference}
-                          className="mt-2 w-full py-2 text-[10px] font-black bg-indigo-50 text-indigo-600 rounded-xl flex items-center justify-center gap-1.5 hover:bg-indigo-100 disabled:opacity-50 transition-all">
-                          <Send size={11} /> {resending === tx.reference ? "Sending..." : "Resend SMS"}
-                        </button>
-                      )}
+                    {tx.status === 'success' && (
+                      <button onClick={() => resendSMS(tx.reference, tx.phone)}
+                        disabled={resending === tx.reference}
+                        className="mt-2 w-full py-2 text-[10px] font-black bg-indigo-50 text-indigo-600 rounded-xl flex items-center justify-center gap-1.5 hover:bg-indigo-100 disabled:opacity-50 transition-all">
+                        <Send size={11} /> {resending === tx.reference ? 'Sending...' : 'Resend SMS'}
+                      </button>
+                    )}
                   </div>
                 ))}
                 {transactions.length === 0 && <div className="text-center py-12 text-black/30"><Receipt size={32} className="mx-auto mb-2 opacity-30" /><p className="text-sm font-semibold">No transactions</p></div>}
@@ -897,6 +925,85 @@ export default function Admin() {
                   </div>
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* ===================== SMS CENTER ===================== */}
+          {activeTab === 'sms' && (
+            <div className="p-4 md:p-8 max-w-2xl">
+              <div className="mb-6">
+                <h1 className="text-xl md:text-2xl font-black tracking-tight">SMS Center</h1>
+                <p className="text-xs text-black/40 mt-0.5">Send bulk messages to your customers</p>
+              </div>
+
+              <form onSubmit={sendBulkSMS} className="space-y-5">
+                <div className="bg-white border border-black/[0.06] rounded-2xl p-5 shadow-sm">
+                  <h3 className="font-black text-xs uppercase tracking-widest mb-4 text-black/50">Recipients</h3>
+                  <div className="grid grid-cols-3 gap-2 mb-4">
+                    {[
+                      { id: 'all', label: 'All Customers', icon: Users },
+                      { id: 'type', label: 'By Type', icon: Package },
+                      { id: 'custom', label: 'Custom List', icon: MessageSquare },
+                    ].map(({ id, label, icon: Icon }) => (
+                      <button key={id} type="button" onClick={() => setSmsAudience(id)}
+                        className={`flex flex-col items-center gap-2 p-3 rounded-xl border-2 transition-all text-xs font-bold ${smsAudience === id ? 'border-indigo-500 bg-indigo-50 text-indigo-700' : 'border-black/10 text-black/40 hover:border-black/20'}`}>
+                        <Icon size={18} />
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  {smsAudience === 'type' && (
+                    <select value={smsVoucherType} onChange={e => setSmsVoucherType(e.target.value)}
+                      className="w-full border border-black/10 rounded-xl px-4 py-3 text-sm font-semibold outline-none focus:border-indigo-400 bg-white">
+                      {TYPES.map(t => <option key={t} value={t}>{t} customers</option>)}
+                    </select>
+                  )}
+                  {smsAudience === 'custom' && (
+                    <div>
+                      <textarea value={smsCustomNumbers} onChange={e => setSmsCustomNumbers(e.target.value)}
+                        placeholder={"0244123456\n0551234567\n233201234567"}
+                        rows={5}
+                        className="w-full border border-black/10 rounded-xl px-4 py-3 text-sm font-mono outline-none focus:border-indigo-400 resize-none" />
+                      <p className="text-[10px] text-black/30 mt-1">One number per line. Accepts 0XX, 233XX, or +233XX formats.</p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="bg-white border border-black/[0.06] rounded-2xl p-5 shadow-sm">
+                  <div className="flex justify-between items-center mb-3">
+                    <h3 className="font-black text-xs uppercase tracking-widest text-black/50">Message</h3>
+                    <span className={`text-[10px] font-bold ${smsMessage.length > 280 ? 'text-amber-500' : 'text-black/30'}`}>
+                      {smsMessage.length}/320
+                    </span>
+                  </div>
+                  <textarea value={smsMessage} onChange={e => setSmsMessage(e.target.value)}
+                    placeholder="WAEC GH: Results for WASSCE 2025 are now available. Visit waecgh.org to check your results."
+                    rows={5}
+                    maxLength={320}
+                    className="w-full border border-black/10 rounded-xl px-4 py-3 text-sm outline-none focus:border-indigo-400 resize-none" />
+                  {smsMessage.length > 160 && (
+                    <div className="flex items-center gap-2 mt-2 text-amber-600 bg-amber-50 rounded-xl px-3 py-2">
+                      <AlertTriangle size={12} />
+                      <span className="text-[10px] font-bold">Over 160 chars — will be billed as {Math.ceil(smsMessage.length / 153)} SMS parts.</span>
+                    </div>
+                  )}
+                </div>
+
+                {smsResult && (
+                  <div className={`rounded-2xl p-4 border ${smsResult.failed === 0 ? 'bg-emerald-50 border-emerald-200' : 'bg-amber-50 border-amber-200'}`}>
+                    <p className="text-sm font-black text-emerald-700">
+                      ✅ {smsResult.sent} sent
+                      {smsResult.failed > 0 && <span className="text-amber-600 ml-2">⚠️ {smsResult.failed} failed</span>}
+                      <span className="text-black/40 font-normal ml-2">of {smsResult.total} total</span>
+                    </p>
+                  </div>
+                )}
+
+                <button type="submit" disabled={smsSending || !smsMessage.trim()}
+                  className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black text-sm tracking-widest uppercase hover:bg-indigo-700 transition-all disabled:opacity-50 flex items-center justify-center gap-2">
+                  {smsSending ? <><RefreshCw size={16} className="animate-spin" /> Sending...</> : <><Send size={16} /> Send SMS</>}
+                </button>
+              </form>
             </div>
           )}
         </main>
