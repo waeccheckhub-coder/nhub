@@ -98,6 +98,8 @@ export default function Admin() {
   const [settingsDraft, setSettingsDraft] = useState({});
   const [settingsLoading, setSettingsLoading] = useState(false);
 
+  const [resending, setResending] = useState(null);
+
   const [inputMode, setInputMode] = useState('manual');
   const [uploadType, setUploadType] = useState('WASSCE');
   const [file, setFile] = useState(null);
@@ -123,6 +125,18 @@ export default function Admin() {
     try { await axios.put('/api/admin/settings', { settings: settingsDraft }); setSettings(settingsDraft); setSettingsEditing(false); toast.success('Settings saved!'); }
     catch (e) { toast.error('Failed to save settings'); }
     setSettingsLoading(false);
+  };
+
+  const resendSMS = async (reference, phone) => {
+    if (!confirm(`Resend voucher SMS to ${phone}?`)) return;
+    setResending(reference);
+    try {
+      await axios.post('/api/admin/resend-sms', { reference });
+      toast.success('SMS resent successfully!');
+    } catch (e) {
+      toast.error(e?.response?.data?.error || 'Failed to resend SMS');
+    }
+    setResending(null);
   };
 
   const handleDelete = async (serial) => {
@@ -390,7 +404,7 @@ export default function Admin() {
                     <div className="hidden md:block overflow-x-auto">
                       <table className="w-full text-sm">
                         <thead className="bg-[#fafafa] border-b border-black/[0.05] text-[9px] font-black uppercase tracking-widest text-black/40">
-                          <tr>{['Reference', 'Phone', 'Type', 'Qty', 'Amount', 'Status', 'Date'].map(h => <th key={h} className="px-5 py-3 text-left">{h}</th>)}</tr>
+                          <tr>{['Reference', 'Phone', 'Type', 'Qty', 'Amount', 'Status', 'Date', ''].map(h => <th key={h} className="px-5 py-3 text-left">{h}</th>)}</tr>
                         </thead>
                         <tbody className="divide-y divide-black/[0.04]">
                           {stats.recentTransactions.map((tx, i) => (
@@ -623,6 +637,13 @@ export default function Admin() {
                       <span>{new Date(tx.created_at).toLocaleDateString()}</span>
                     </div>
                     <p className="font-mono text-[9px] text-black/30 mt-1 truncate">{tx.reference}</p>
+                      {tx.status === "success" && (
+                        <button onClick={() => resendSMS(tx.reference, tx.phone)}
+                          disabled={resending === tx.reference}
+                          className="mt-2 w-full py-2 text-[10px] font-black bg-indigo-50 text-indigo-600 rounded-xl flex items-center justify-center gap-1.5 hover:bg-indigo-100 disabled:opacity-50 transition-all">
+                          <Send size={11} /> {resending === tx.reference ? "Sending..." : "Resend SMS"}
+                        </button>
+                      )}
                   </div>
                 ))}
                 {transactions.length === 0 && <div className="text-center py-12 text-black/30"><Receipt size={32} className="mx-auto mb-2 opacity-30" /><p className="text-sm font-semibold">No transactions</p></div>}
@@ -633,7 +654,7 @@ export default function Admin() {
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead className="bg-[#fafafa] border-b border-black/[0.05] text-[9px] font-black uppercase tracking-widest text-black/40">
-                      <tr>{['Reference', 'Phone', 'Type', 'Qty', 'Amount', 'Status', 'Date'].map(h => <th key={h} className="px-5 py-3 text-left">{h}</th>)}</tr>
+                      <tr>{['Reference', 'Phone', 'Type', 'Qty', 'Amount', 'Status', 'Date', ''].map(h => <th key={h} className="px-5 py-3 text-left">{h}</th>)}</tr>
                     </thead>
                     <tbody className="divide-y divide-black/[0.04]">
                       {transactions.map((tx, i) => (
@@ -645,6 +666,15 @@ export default function Admin() {
                           <td className="px-5 py-3 text-xs font-bold text-emerald-600">GHS {tx.amount}</td>
                           <td className="px-5 py-3"><StatusBadge status={tx.status} /></td>
                           <td className="px-5 py-3 text-[10px] text-black/40">{new Date(tx.created_at).toLocaleString()}</td>
+                          <td className="px-5 py-3">
+                            {tx.status === 'success' && (
+                              <button onClick={() => resendSMS(tx.reference, tx.phone)}
+                                disabled={resending === tx.reference}
+                                className="text-[10px] font-black text-indigo-600 bg-indigo-50 px-3 py-1.5 rounded-lg hover:bg-indigo-100 disabled:opacity-50 flex items-center gap-1 transition-all">
+                                <Send size={10} /> {resending === tx.reference ? '...' : 'Resend'}
+                              </button>
+                            )}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
