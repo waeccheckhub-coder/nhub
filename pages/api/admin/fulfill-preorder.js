@@ -1,7 +1,14 @@
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "../auth/[...nextauth]";
 import db from '../../../lib/db';
-import { sendVoucherSMS } from '../../../lib/sms';
+
+function getPortalLink(type) {
+  const t = (type || '').toUpperCase();
+  if (t.includes('WASSCE') || t.includes('NOVDEC')) return 'https://ghana.waecdirect.org';
+  if (t.includes('BECE')) return 'https://eresults.waecgh.org';
+  if (t.includes('CSSPS') || t.includes('PLACEMENT')) return 'https://www.cssps.gov.gh';
+  return 'https://waeccardsonline.com';
+}
 
 export default async function handler(req, res) {
   const session = await getServerSession(req, res, authOptions);
@@ -27,7 +34,7 @@ export default async function handler(req, res) {
       await client.query('BEGIN');
 
       const vouchers = await client.query(
-        `SELECT id, serial, pin FROM vouchers
+        `SELECT id, serial, pin FROM vouchers 
          WHERE type = $1 AND status = 'available'
          LIMIT $2
          FOR UPDATE SKIP LOCKED`,
@@ -43,7 +50,6 @@ export default async function handler(req, res) {
       }
 
       const voucherIds = vouchers.rows.map(v => v.id);
-
       await client.query(
         `UPDATE vouchers SET status = 'sold', sold_to = $1, sold_at = NOW(), transaction_ref = $2
          WHERE id = ANY($3)`,
@@ -56,16 +62,33 @@ export default async function handler(req, res) {
       );
 
       await client.query(
-        `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-         VALUES ($1, $2, $3, $4, $5, 'success', NOW())
-         ON CONFLICT (reference) DO UPDATE SET status = 'success'`,
-        [reference, phone, amount, quantity, type]
+        `UPDATE transactions SET status = 'success' WHERE reference = $1`,
+        [reference]
       );
 
       await client.query('COMMIT');
       client.release();
 
-      await sendVoucherSMS(phone, vouchers.rows, type, { waitMessage: true });
+      // Send SMS via Arkesel v2
+      const voucherDetails = vouchers.rows.map((v, i) => `${i + 1}. S/N: ${v.serial} PIN: ${v.pin}`).join('\n');
+      const smsMessage = `Your ${type} checker voucher(s) are ready!\n\n${voucherDetails}\n\nCheck results: ${getPortalLink(type)}\n\nSorry for the wait — thank you!`;
+      // Normalise phone to 233XXXXXXXXX
+      const cleanPhone = (phone || '').replace(/\s+/g, '');
+      const formattedPhone = cleanPhone.startsWith('+233') ? cleanPhone.slice(1)
+        : cleanPhone.startsWith('233') ? cleanPhone
+        : cleanPhone.startsWith('0')   ? '233' + cleanPhone.slice(1)
+        : cleanPhone;
+      try {
+        await fetch('https://sms.arkesel.com/api/v2/sms/send', {
+          method: 'POST',
+          headers: { 'api-key': process.env.ARKESEL_API_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sender: process.env.ARKESEL_SENDER_ID || 'WAEC-GH',
+            message: smsMessage,
+            recipients: [formattedPhone],
+          }),
+        });
+      } catch (e) { console.error('SMS error:', e.message); }
 
       return res.status(200).json({
         success: true,
