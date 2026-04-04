@@ -11,7 +11,7 @@ export default async function handler(req, res) {
       getSetting('support_whatsapp', ''),
     ]);
 
-    const stock = { WASSCE: 0, BECE: 0, CSSPS: 0 };
+    const stock = { WASSCE: 0, BECE: 0 };
     stockRes.rows.forEach(row => { stock[row.type] = parseInt(row.count); });
 
     res.status(200).json({ stock, prices, supportWhatsapp });
