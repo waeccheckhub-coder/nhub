@@ -14,7 +14,7 @@ async function sendVoucherSMS(phone, vouchers, voucherType) {
     const u = (t || '').toUpperCase();
     if (u.includes('WASSCE') || u.includes('NOVDEC')) return 'https://ghana.waecdirect.org';
     if (u.includes('BECE')) return 'https://eresults.waecgh.org';
-    if (u.includes('CSSPS') || u.includes('PLACEMENT')) return 'https://www.cssps.gov.gh';
+
     return 'https://waeccardsonline.com';
   };
 
