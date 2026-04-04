@@ -9,7 +9,7 @@ function getPortalLink(type) {
   const t = (type || '').toUpperCase();
   if (t.includes('WASSCE') || t.includes('NOVDEC')) return 'https://ghana.waecdirect.org';
   if (t.includes('BECE')) return 'https://eresults.waecgh.org';
-  if (t.includes('CSSPS') || t.includes('PLACEMENT')) return 'https://www.cssps.gov.gh';
+
   return 'https://waeccardsonline.com';
 }
 
