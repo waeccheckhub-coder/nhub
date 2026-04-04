@@ -1051,10 +1051,7 @@ export default function Admin() {
               {/* ── Moolre panel ── */}
               {smsProvider === 'moolre' && (
                 <form onSubmit={sendMoolreSMS} className="space-y-5">
-                  <div className="bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 text-xs text-amber-800 font-semibold flex items-center gap-2">
-                    <AlertTriangle size={13} className="flex-shrink-0" />
-                    Sends via Moolre SMS API with sender ID <strong>Best_Offers</strong>. Requires <code className="bg-amber-100 px-1 rounded">MOOLRE_SMS_VASKEY</code> in your environment variables.
-                  </div>
+                  
 
                   <div className="bg-white border border-black/[0.06] rounded-2xl p-5 shadow-sm">
                     <h3 className="font-black text-xs uppercase tracking-widest mb-4 text-black/50">Recipients</h3>
