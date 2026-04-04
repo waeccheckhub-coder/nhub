@@ -23,7 +23,7 @@ const TABS = [
   { id: 'sms', label: 'SMS Center', icon: MessageSquare },
 ];
 
-const TYPES = ['WASSCE', 'BECE', 'CSSPS'];
+const TYPES = ['WASSCE', 'BECE'];
 const STATUSES = ['available', 'sold', 'used'];
 
 const StatusBadge = ({ status }) => {
@@ -106,6 +106,13 @@ export default function Admin() {
   const [smsSending, setSmsSending] = useState(false);
   const [smsResult, setSmsResult] = useState(null);
   const [resending, setResending] = useState(null);
+  const [smsProvider, setSmsProvider] = useState('arkesel');
+  const [moolreSmsMessage, setMoolreSmsMessage] = useState('');
+  const [moolreSmsAudience, setMoolreSmsAudience] = useState('all');
+  const [moolreSmsVoucherType, setMoolreSmsVoucherType] = useState('WASSCE');
+  const [moolreSmsCustomNumbers, setMoolreSmsCustomNumbers] = useState('');
+  const [moolreSmsSending, setMoolreSmsSending] = useState(false);
+  const [moolreSmsResult, setMoolreSmsResult] = useState(null);
 
   const [inputMode, setInputMode] = useState('manual');
   const [uploadType, setUploadType] = useState('WASSCE');
@@ -153,6 +160,27 @@ export default function Admin() {
       toast.error(e?.response?.data?.error || 'Failed to send SMS');
     }
     setSmsSending(false);
+  };
+
+  const sendMoolreSMS = async (e) => {
+    e.preventDefault();
+    if (!moolreSmsMessage.trim()) return toast.error('Message is required');
+    if (!confirm(`Send via Moolre (Best_Offers) to ${moolreSmsAudience === 'custom' ? 'custom list' : moolreSmsAudience === 'all' ? 'ALL customers' : moolreSmsVoucherType + ' customers'}?\n\nMessage: ${moolreSmsMessage}`)) return;
+    setMoolreSmsSending(true);
+    setMoolreSmsResult(null);
+    try {
+      const res = await axios.post('/api/admin/moolre-sms-center', {
+        message: moolreSmsMessage,
+        audience: moolreSmsAudience,
+        voucherType: moolreSmsVoucherType,
+        customNumbers: moolreSmsCustomNumbers,
+      });
+      setMoolreSmsResult(res.data);
+      toast.success(`Moolre SMS sent to ${res.data.sent} recipients!`);
+    } catch (e) {
+      toast.error(e?.response?.data?.error || 'Failed to send via Moolre');
+    }
+    setMoolreSmsSending(false);
   };
 
   const resendSMS = async (reference, phone) => {
@@ -936,7 +964,22 @@ export default function Admin() {
                 <p className="text-xs text-black/40 mt-0.5">Send bulk messages to your customers</p>
               </div>
 
-              <form onSubmit={sendBulkSMS} className="space-y-5">
+              {/* Provider tabs */}
+              <div className="flex gap-1 p-1 bg-black/5 rounded-2xl mb-6">
+                {[
+                  { id: 'arkesel', label: 'Arkesel', sub: process.env.NEXT_PUBLIC_ARKESEL_SENDER_ID || 'WAEC-GH' },
+                  { id: 'moolre', label: 'Moolre', sub: 'Best_Offers' },
+                ].map(p => (
+                  <button key={p.id} type="button" onClick={() => setSmsProvider(p.id)}
+                    className={`flex-1 py-2.5 px-4 rounded-xl text-xs font-black transition-all ${smsProvider === p.id ? 'bg-white shadow text-indigo-600' : 'text-black/40 hover:text-black'}`}>
+                    {p.label}
+                    <span className="block text-[9px] font-bold opacity-60 mt-0.5">{p.sub}</span>
+                  </button>
+                ))}
+              </div>
+
+              {/* ── Arkesel panel ── */}
+              {smsProvider === 'arkesel' && <form onSubmit={sendBulkSMS} className="space-y-5">
                 <div className="bg-white border border-black/[0.06] rounded-2xl p-5 shadow-sm">
                   <h3 className="font-black text-xs uppercase tracking-widest mb-4 text-black/50">Recipients</h3>
                   <div className="grid grid-cols-3 gap-2 mb-4">
@@ -1003,7 +1046,79 @@ export default function Admin() {
                   className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black text-sm tracking-widest uppercase hover:bg-indigo-700 transition-all disabled:opacity-50 flex items-center justify-center gap-2">
                   {smsSending ? <><RefreshCw size={16} className="animate-spin" /> Sending...</> : <><Send size={16} /> Send SMS</>}
                 </button>
-              </form>
+              </form>}
+
+              {/* ── Moolre panel ── */}
+              {smsProvider === 'moolre' && (
+                <form onSubmit={sendMoolreSMS} className="space-y-5">
+                  <div className="bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 text-xs text-amber-800 font-semibold flex items-center gap-2">
+                    <AlertTriangle size={13} className="flex-shrink-0" />
+                    Sends via Moolre SMS API with sender ID <strong>Best_Offers</strong>. Requires <code className="bg-amber-100 px-1 rounded">MOOLRE_SMS_VASKEY</code> in your environment variables.
+                  </div>
+
+                  <div className="bg-white border border-black/[0.06] rounded-2xl p-5 shadow-sm">
+                    <h3 className="font-black text-xs uppercase tracking-widest mb-4 text-black/50">Recipients</h3>
+                    <div className="grid grid-cols-3 gap-2 mb-4">
+                      {[
+                        { id: 'all', label: 'All Customers', icon: Users },
+                        { id: 'type', label: 'By Type', icon: Package },
+                        { id: 'custom', label: 'Custom List', icon: MessageSquare },
+                      ].map(({ id, label, icon: Icon }) => (
+                        <button key={id} type="button" onClick={() => setMoolreSmsAudience(id)}
+                          className={`flex flex-col items-center gap-2 p-3 rounded-xl border-2 transition-all text-xs font-bold ${moolreSmsAudience === id ? 'border-indigo-500 bg-indigo-50 text-indigo-700' : 'border-black/10 text-black/40 hover:border-black/20'}`}>
+                          <Icon size={18} />
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                    {moolreSmsAudience === 'type' && (
+                      <select value={moolreSmsVoucherType} onChange={e => setMoolreSmsVoucherType(e.target.value)}
+                        className="w-full border border-black/10 rounded-xl px-4 py-3 text-sm font-semibold outline-none focus:border-indigo-400 bg-white">
+                        {TYPES.map(t => <option key={t} value={t}>{t} customers</option>)}
+                      </select>
+                    )}
+                    {moolreSmsAudience === 'custom' && (
+                      <div>
+                        <textarea value={moolreSmsCustomNumbers} onChange={e => setMoolreSmsCustomNumbers(e.target.value)}
+                          placeholder={"0244123456\n0551234567\n233201234567"}
+                          rows={5}
+                          className="w-full border border-black/10 rounded-xl px-4 py-3 text-sm font-mono outline-none focus:border-indigo-400 resize-none" />
+                        <p className="text-[10px] text-black/30 mt-1">One number per line. Accepts 0XX, 233XX, or +233XX formats.</p>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="bg-white border border-black/[0.06] rounded-2xl p-5 shadow-sm">
+                    <div className="flex justify-between items-center mb-3">
+                      <h3 className="font-black text-xs uppercase tracking-widest text-black/50">Message</h3>
+                      <span className={`text-[10px] font-bold ${moolreSmsMessage.length > 140 ? 'text-amber-500' : 'text-black/30'}`}>
+                        {moolreSmsMessage.length}/160
+                      </span>
+                    </div>
+                    <textarea value={moolreSmsMessage} onChange={e => setMoolreSmsMessage(e.target.value)}
+                      placeholder="Best_Offers: WASSCE 2025 results are now available. Visit waecgh.org to check your results."
+                      rows={5}
+                      maxLength={160}
+                      className="w-full border border-black/10 rounded-xl px-4 py-3 text-sm outline-none focus:border-indigo-400 resize-none" />
+                    <p className="text-[10px] text-black/30 mt-1">Max 160 characters per message (Moolre SMS limit).</p>
+                  </div>
+
+                  {moolreSmsResult && (
+                    <div className={`rounded-2xl p-4 border ${moolreSmsResult.failed === 0 ? 'bg-emerald-50 border-emerald-200' : 'bg-amber-50 border-amber-200'}`}>
+                      <p className="text-sm font-black text-emerald-700">
+                        ✅ {moolreSmsResult.sent} sent
+                        {moolreSmsResult.failed > 0 && <span className="text-amber-600 ml-2">⚠️ {moolreSmsResult.failed} failed</span>}
+                        <span className="text-black/40 font-normal ml-2">of {moolreSmsResult.total} total</span>
+                      </p>
+                    </div>
+                  )}
+
+                  <button type="submit" disabled={moolreSmsSending || !moolreSmsMessage.trim()}
+                    className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black text-sm tracking-widest uppercase hover:bg-indigo-700 transition-all disabled:opacity-50 flex items-center justify-center gap-2">
+                    {moolreSmsSending ? <><RefreshCw size={16} className="animate-spin" /> Sending...</> : <><Send size={16} /> Send via Moolre</>}
+                  </button>
+                </form>
+              )}
             </div>
           )}
         </main>
@@ -1020,7 +1135,7 @@ function UploadForm({ uploadType, setUploadType, inputMode, setInputMode, manual
         <label className="text-[10px] font-bold uppercase text-black/40 tracking-widest block mb-2">Category</label>
         <select value={uploadType} onChange={e => setUploadType(e.target.value)}
           className="w-full border border-black/10 rounded-xl py-2.5 px-3 text-sm font-bold outline-none focus:border-indigo-500 bg-white">
-          {['WASSCE', 'BECE', 'CSSPS'].map(t => <option key={t} value={t}>{t}</option>)}
+          {TYPES.map(t => <option key={t} value={t}>{t}</option>)}
         </select>
       </div>
       <div className="flex gap-1 p-1 bg-[#f0f0f0] rounded-xl">
