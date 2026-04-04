@@ -1,34 +1,74 @@
-import { getServerSession } from "next-auth/next";
-import { authOptions } from "../auth/[...nextauth]";
-import { getAllSettings, setSetting } from '../../../lib/settings';
+import db from './db';
 
-export default async function handler(req, res) {
-  const session = await getServerSession(req, res, authOptions);
-  if (!session) return res.status(401).json({ error: "Access Denied" });
+// Ensure settings table exists
+export async function ensureSettingsTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key VARCHAR(100) PRIMARY KEY,
+      value TEXT,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+}
 
-  if (req.method === 'GET') {
-    const settings = await getAllSettings();
-    return res.status(200).json({ settings });
+// Ensure preorders table exists
+export async function ensurePreordersTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS preorders (
+      id SERIAL PRIMARY KEY,
+      reference VARCHAR(100) UNIQUE NOT NULL,
+      phone VARCHAR(20) NOT NULL,
+      name VARCHAR(100),
+      amount NUMERIC(10,2) NOT NULL,
+      quantity INTEGER NOT NULL DEFAULT 1,
+      voucher_type VARCHAR(50) NOT NULL,
+      status VARCHAR(20) DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      fulfilled_at TIMESTAMP
+    )
+  `);
+}
+
+export async function getSetting(key, defaultValue = null) {
+  try {
+    await ensureSettingsTable();
+    const result = await db.query('SELECT value FROM settings WHERE key = $1', [key]);
+    if (result.rows.length === 0) return defaultValue;
+    return result.rows[0].value;
+  } catch (err) {
+    console.error('getSetting error:', err.message);
+    return defaultValue;
   }
+}
 
-  if (req.method === 'POST') {
-    const { key, value } = req.body;
-    if (!key) return res.status(400).json({ error: 'Missing key' });
-    await setSetting(key, value);
-    return res.status(200).json({ success: true, key, value });
-  }
+export async function setSetting(key, value) {
+  await ensureSettingsTable();
+  await db.query(
+    `INSERT INTO settings (key, value, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+    [key, value]
+  );
+}
 
-  // Bulk update
-  if (req.method === 'PUT') {
-    const { settings } = req.body;
-    if (!settings || typeof settings !== 'object') {
-      return res.status(400).json({ error: 'Invalid settings object' });
-    }
-    for (const [key, value] of Object.entries(settings)) {
-      await setSetting(key, value);
-    }
-    return res.status(200).json({ success: true });
-  }
+export async function getAllSettings() {
+  await ensureSettingsTable();
+  const result = await db.query('SELECT key, value FROM settings');
+  const settings = {};
+  result.rows.forEach(row => { settings[row.key] = row.value; });
+  return settings;
+}
 
-  return res.status(405).end();
+// Default prices
+export const DEFAULT_PRICES = {
+  WASSCE: 30,
+  BECE: 30,
+};
+
+export async function getPrices() {
+  const settings = await getAllSettings();
+  return {
+    WASSCE: parseFloat(settings['price_WASSCE'] || DEFAULT_PRICES.WASSCE),
+    BECE: parseFloat(settings['price_BECE'] || DEFAULT_PRICES.BECE),
+  };
 }
