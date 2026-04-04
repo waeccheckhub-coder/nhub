@@ -272,6 +272,136 @@ async function handlePaymentWebhook(res, payload) {
   }
 }
 
+
+// ── Poll for payment confirmation ─────────────────────────────────────────────
+// Polls Moolre every 5s for up to 60s after a USSD payment is triggered.
+// Fulfills the order directly if payment confirmed — handles the case where
+// Moolre does not fire a webhook for USSD-triggered direct debit payments.
+
+async function pollAndFulfill({ ref, phone, voucherType, quantity, total }) {
+  const maxAttempts = 12; // 12 x 5s = 60s
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await delay(5000);
+    try {
+      const statusRes = await fetch('https://api.moolre.com/open/transact/status', {
+        method: 'POST',
+        headers: {
+          'X-API-USER':   process.env.MOOLRE_USERNAME,
+          'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          type:          1,
+          idtype:        1,
+          id:            ref,
+          accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+        }),
+      });
+      const statusData = await statusRes.json();
+      const txstatus = Number(statusData?.data?.txstatus);
+      console.log(`[USSD] Poll attempt ${attempt} for ${ref}: txstatus=${txstatus}`);
+
+      if (txstatus === 2) {
+        // Payment failed — release pre-assigned vouchers back to available
+        console.log('[USSD] Payment failed — releasing reserved vouchers for', ref);
+        await pool.query(
+          `UPDATE vouchers SET status='available', sold_to=NULL, transaction_ref=NULL, sold_at=NULL
+           WHERE transaction_ref=$1 AND status='sold'`,
+          [ref]
+        );
+        await pool.query(
+          `UPDATE transactions SET status='failed' WHERE reference=$1`,
+          [ref]
+        );
+        return;
+      }
+
+      if (txstatus !== 1) continue; // still pending
+
+      // Payment confirmed — check idempotency first
+      const already = await pool.query(
+        `SELECT id FROM transactions WHERE reference=$1 AND status='success'`,
+        [ref]
+      );
+      if (already.rowCount > 0) {
+        console.log('[USSD] Poll: already fulfilled', ref);
+        return;
+      }
+
+      // Fulfill
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+
+        const preAssigned = await client.query(
+          `SELECT id, serial, pin FROM vouchers WHERE transaction_ref=$1 AND status='sold'`,
+          [ref]
+        );
+
+        if (preAssigned.rowCount >= quantity) {
+          await client.query(
+            `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
+             VALUES ($1,$2,$3,$4,$5,'success',NOW())
+             ON CONFLICT (reference) DO UPDATE SET status='success'`,
+            [ref, phone, parseFloat(total), quantity, voucherType]
+          );
+          await client.query('COMMIT');
+          client.release();
+          await sendVoucherSMS(phone, preAssigned.rows, voucherType);
+          console.log('[USSD] Poll fulfilled:', ref);
+          return;
+        }
+
+        // No pre-assigned — grab fresh vouchers
+        const vouchers = await client.query(
+          `SELECT id, serial, pin FROM vouchers
+           WHERE type=$1 AND status='available'
+           LIMIT $2 FOR UPDATE SKIP LOCKED`,
+          [voucherType, quantity]
+        );
+
+        if (vouchers.rowCount < quantity) {
+          await client.query('COMMIT');
+          client.release();
+          await sendPreorderSMS(phone, voucherType, ref);
+          await sendAdminAlert(`OUT OF STOCK (poll): ${voucherType} x${quantity} from ${phone}. Ref: ${ref}`);
+          return;
+        }
+
+        const ids = vouchers.rows.map(v => v.id);
+        await client.query(
+          `UPDATE vouchers SET status='sold', sold_to=$1, sold_at=NOW(), transaction_ref=$2 WHERE id=ANY($3)`,
+          [phone, ref, ids]
+        );
+        await client.query(
+          `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
+           VALUES ($1,$2,$3,$4,$5,'success',NOW())
+           ON CONFLICT (reference) DO UPDATE SET status='success'`,
+          [ref, phone, parseFloat(total), quantity, voucherType]
+        );
+        await client.query('COMMIT');
+        client.release();
+        await sendVoucherSMS(phone, vouchers.rows, voucherType);
+        console.log('[USSD] Poll fulfilled (fresh vouchers):', ref);
+        return;
+
+      } catch (err) {
+        await client.query('ROLLBACK');
+        client.release();
+        console.error('[USSD] Poll fulfill error:', err.message);
+        return;
+      }
+
+    } catch (err) {
+      console.error(`[USSD] Poll attempt ${attempt} error:`, err.message);
+    }
+  }
+
+  console.warn('[USSD] Poll timed out for', ref);
+}
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
@@ -344,7 +474,6 @@ export default async function handler(req, res) {
         `Welcome to WAEC GH Checkers\n` +
         `1. WASSCE (GHS ${prices.WASSCE})\n` +
         `2. BECE (GHS ${prices.BECE})\n` +
-        `3. CSSPS (GHS ${prices.CSSPS})\n` +
         `0. Exit`,
         true
       );
@@ -358,11 +487,11 @@ export default async function handler(req, res) {
     switch (session.stage) {
 
       case 'MENU': {
-        const typeMap = { '1': 'WASSCE', '2': 'BECE', '3': 'CSSPS' };
+        const typeMap = { '1': 'WASSCE', '2': 'BECE' };
         if (choice === '0') return respond('Thank you. Goodbye!', false);
         if (!typeMap[choice]) {
           return respond(
-            `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. CSSPS (GHS ${prices.CSSPS})\n0. Exit`,
+            `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n0. Exit`,
             true
           );
         }
@@ -471,8 +600,7 @@ export default async function handler(req, res) {
                            msisdn.startsWith('+233') ? '0' + msisdn.slice(4)  :
                            msisdn;
 
-        // Trigger MoMo PIN prompt — must await before responding
-        // (Vercel kills the function the moment res is sent)
+        // Trigger MoMo PIN prompt
         try {
           const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
             method: 'POST',
@@ -499,6 +627,10 @@ export default async function handler(req, res) {
           console.error('[USSD] Moolre payment error:', payErr.message);
         }
 
+        // Poll for payment status as fallback — Moolre may not fire a webhook
+        // for USSD-triggered payments. Poll every 5s for up to 60s.
+        pollAndFulfill({ ref, phone: msisdn, voucherType, quantity, total });
+
         return respond(
           `Please authorize the GHS ${total} MoMo payment prompt on your phone.\nVouchers will be sent via SMS after payment.`,
           false
@@ -508,7 +640,7 @@ export default async function handler(req, res) {
       default:
         await setSession(sessionId, { stage: 'MENU' });
         return respond(
-          `WAEC GH Checkers\n1. WASSCE\n2. BECE\n3. CSSPS\n0. Exit`,
+          `WAEC GH Checkers\n1. WASSCE\n2. BECE\n0. Exit`,
           true
         );
     }
