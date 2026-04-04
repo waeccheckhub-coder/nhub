@@ -11,13 +11,13 @@ export default function Home() {
   const [phone, setPhone] = useState('');
   const [name, setName] = useState('');
   const [network, setNetwork] = useState('MTN');
-  const [quantities, setQuantities] = useState({ WASSCE: 1, BECE: 1, CSSPS: 1 });
+  const [quantities, setQuantities] = useState({ WASSCE: 1, BECE: 1 });
   const [retrieveInput, setRetrieveInput] = useState('');
   const [retrievedData, setRetrievedData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [payingFor, setPayingFor] = useState(null);
-  const [stock, setStock] = useState({ WASSCE: 0, BECE: 0, CSSPS: 0 });
-  const [prices, setPrices] = useState({ WASSCE: 30, BECE: 30, CSSPS: 30 });
+  const [stock, setStock] = useState({ WASSCE: 0, BECE: 0 });
+  const [prices, setPrices] = useState({ WASSCE: 30, BECE: 30 });
   const [supportWhatsapp, setSupportWhatsapp] = useState('');
   const [allowPreorder, setAllowPreorder] = useState(false);
 
@@ -95,13 +95,12 @@ export default function Home() {
   const VOUCHER_TYPES = [
     { id: 'WASSCE', label: 'WASSCE / NOVDEC', desc: 'Results Checker Voucher', color: 'from-violet-600 to-indigo-600' },
     { id: 'BECE', label: 'BECE Voucher', desc: 'Junior High School Results Checker', color: 'from-blue-600 to-cyan-500' },
-    { id: 'CSSPS', label: 'School Placement (CSSPS)', desc: 'Senior High School Placement Voucher', color: 'from-emerald-600 to-teal-500' },
   ];
 
   return (
     <div className="min-h-screen aura-bg text-[#1e293b] font-outfit selection:bg-[#4f46e5] selection:text-white">
       <Head>
-        <title>WAEC GH CHECKERS — Instant WASSCE, BECE & CSSPS Delivery</title>
+        <title>WAEC GH CHECKERS — Instant WASSCE & BECE Delivery</title>
         <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Space+Grotesk:wght@700&display=swap" rel="stylesheet" />
       </Head>
       <Toaster position="top-center" />
@@ -126,7 +125,7 @@ export default function Home() {
         {/* Hero */}
         <section className="text-center mb-12 pt-4">
           <h1 className="font-space text-4xl md:text-[48px] font-bold leading-[1.1] mb-4 tracking-[-1px]">
-            Buy WASSCE, BECE & CSSPS <span className="text-[#4f46e5]">Instantly</span>
+            Buy WASSCE & BECE <span className="text-[#4f46e5]">Instantly</span>
           </h1>
           <p className="text-[#64748b] text-lg mb-2">Authentic WAEC result checkers delivered via SMS. Pay with Mobile Money.</p>
           <p className="text-sm text-[#64748b]">Powered by <strong>Moolre</strong> — MTN MoMo, Telecel Cash, AT Money accepted</p>
