@@ -91,7 +91,7 @@ export default function ThankYou() {
     const t = (type || '').toUpperCase();
     if (t.includes('BECE')) return { name: 'BECE Portal', url: 'https://eresults.waecgh.org' };
     if (t.includes('WASSCE') || t.includes('NOVDEC')) return { name: 'WASSCE Portal', url: 'https://ghana.waecdirect.org' };
-    if (t.includes('CSSPS') || t.includes('PLACEMENT')) return { name: 'Placement Portal', url: 'https://www.cssps.gov.gh/' };
+
     return null;
   };
 
@@ -113,7 +113,7 @@ export default function ThankYou() {
     });
     const finalY = doc.lastAutoTable.finalY || 44;
     doc.setFontSize(9);
-    doc.text('Keep this document safe. Use your PINs on the official WAEC/CSSPS portals.', 14, finalY + 10);
+    doc.text('Keep this document safe. Use your PINs on the official WAEC portals.', 14, finalY + 10);
     doc.save(`Vouchers_${ref}.pdf`);
     toast.success('PDF Downloaded!');
   };
