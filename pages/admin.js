@@ -147,15 +147,28 @@ export default function Admin() {
     if (!confirm(`Send SMS to ${smsAudience === 'custom' ? 'custom list' : smsAudience === 'all' ? 'ALL customers' : smsVoucherType + ' customers'}?\n\nMessage: ${smsMessage}`)) return;
     setSmsSending(true);
     setSmsResult(null);
+
+    let offset = 0;
+    let totalSent = 0;
+    let totalFailed = 0;
+    let total = 0;
+
     try {
-      const res = await axios.post('/api/admin/sms-center', {
-        message: smsMessage,
-        audience: smsAudience,
-        voucherType: smsVoucherType,
-        customNumbers: smsCustomNumbers,
-      });
-      setSmsResult(res.data);
-      toast.success(`SMS sent to ${res.data.sent} recipients!`);
+      while (true) {
+        const res = await axios.post('/api/admin/sms-center', {
+          message: smsMessage, audience: smsAudience,
+          voucherType: smsVoucherType, customNumbers: smsCustomNumbers,
+          offset,
+        });
+        const d = res.data;
+        total = d.total;
+        totalSent += d.sent;
+        totalFailed += d.failed;
+        setSmsResult({ total, sent: totalSent, failed: totalFailed });
+        if (!d.nextOffset) break;
+        offset = d.nextOffset;
+      }
+      toast.success(`SMS sent to ${totalSent} recipients!`);
     } catch (e) {
       toast.error(e?.response?.data?.error || 'Failed to send SMS');
     }
@@ -168,15 +181,28 @@ export default function Admin() {
     if (!confirm(`Send via Moolre (Best_Offers) to ${moolreSmsAudience === 'custom' ? 'custom list' : moolreSmsAudience === 'all' ? 'ALL customers' : moolreSmsVoucherType + ' customers'}?\n\nMessage: ${moolreSmsMessage}`)) return;
     setMoolreSmsSending(true);
     setMoolreSmsResult(null);
+
+    let offset = 0;
+    let totalSent = 0;
+    let totalFailed = 0;
+    let total = 0;
+
     try {
-      const res = await axios.post('/api/admin/moolre-sms-center', {
-        message: moolreSmsMessage,
-        audience: moolreSmsAudience,
-        voucherType: moolreSmsVoucherType,
-        customNumbers: moolreSmsCustomNumbers,
-      });
-      setMoolreSmsResult(res.data);
-      toast.success(`Moolre SMS sent to ${res.data.sent} recipients!`);
+      while (true) {
+        const res = await axios.post('/api/admin/moolre-sms-center', {
+          message: moolreSmsMessage, audience: moolreSmsAudience,
+          voucherType: moolreSmsVoucherType, customNumbers: moolreSmsCustomNumbers,
+          offset,
+        });
+        const d = res.data;
+        total = d.total;
+        totalSent += d.sent;
+        totalFailed += d.failed;
+        setMoolreSmsResult({ total, sent: totalSent, failed: totalFailed });
+        if (!d.nextOffset) break;
+        offset = d.nextOffset;
+      }
+      toast.success(`Moolre SMS sent to ${totalSent} recipients!`);
     } catch (e) {
       toast.error(e?.response?.data?.error || 'Failed to send via Moolre');
     }
@@ -967,7 +993,7 @@ export default function Admin() {
               {/* Provider tabs */}
               <div className="flex gap-1 p-1 bg-black/5 rounded-2xl mb-6">
                 {[
-                  { id: 'arkesel', label: 'Arkesel', sub: process.env.NEXT_PUBLIC_ARKESEL_SENDER_ID || 'WAEC-GH' },
+                  { id: 'arkesel', label: 'Arkesel', sub: 'WAEC-GH' },
                   { id: 'moolre', label: 'Moolre', sub: 'Best_Offers' },
                 ].map(p => (
                   <button key={p.id} type="button" onClick={() => setSmsProvider(p.id)}
@@ -979,7 +1005,7 @@ export default function Admin() {
               </div>
 
               {/* ── Arkesel panel ── */}
-              {smsProvider === 'arkesel' && <form onSubmit={sendBulkSMS} className="space-y-5">
+              {smsProvider === 'arkesel' && (<form onSubmit={sendBulkSMS} className="space-y-5">
                 <div className="bg-white border border-black/[0.06] rounded-2xl p-5 shadow-sm">
                   <h3 className="font-black text-xs uppercase tracking-widest mb-4 text-black/50">Recipients</h3>
                   <div className="grid grid-cols-3 gap-2 mb-4">
@@ -1046,12 +1072,15 @@ export default function Admin() {
                   className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black text-sm tracking-widest uppercase hover:bg-indigo-700 transition-all disabled:opacity-50 flex items-center justify-center gap-2">
                   {smsSending ? <><RefreshCw size={16} className="animate-spin" /> Sending...</> : <><Send size={16} /> Send SMS</>}
                 </button>
-              </form>}
+              </form>)}
 
               {/* ── Moolre panel ── */}
               {smsProvider === 'moolre' && (
                 <form onSubmit={sendMoolreSMS} className="space-y-5">
-                  
+                  <div className="bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 text-xs text-amber-800 font-semibold flex items-center gap-2">
+                    <AlertTriangle size={13} className="flex-shrink-0" />
+                    Sends via Moolre SMS API with sender ID <strong>Best_Offers</strong>. Requires <code className="bg-amber-100 px-1 rounded">MOOLRE_SMS_VASKEY</code> in your environment variables.
+                  </div>
 
                   <div className="bg-white border border-black/[0.06] rounded-2xl p-5 shadow-sm">
                     <h3 className="font-black text-xs uppercase tracking-widest mb-4 text-black/50">Recipients</h3>
