@@ -7,6 +7,7 @@ import { authOptions } from '../auth/[...nextauth]';
 import pool from '../../../lib/db';
 import { v4 as uuidv4 } from 'uuid';
 
+
 const MOOLRE_SMS_URL  = 'https://api.moolre.com/open/sms/send';
 const SENDER_ID       = 'Best_Offers';
 const BATCH_SIZE      = 100; // max recipients per request
@@ -49,37 +50,45 @@ export default async function handler(req, res) {
 
   if (phones.length === 0) return res.status(400).json({ error: 'No recipients found' });
 
-  const formatted = phones.map(normalisePhone);
+  const allFormatted = phones.map(normalisePhone);
+
+  // Hobby plan: process one page of 25 per request
+  const BATCH_SIZE = 25;
+  const offset = parseInt(req.body.offset || 0);
+  const batch = allFormatted.slice(offset, offset + BATCH_SIZE);
+  const remaining = allFormatted.length - offset - batch.length;
 
   let sent = 0;
   let failed = 0;
 
-  for (let i = 0; i < formatted.length; i += BATCH_SIZE) {
-    const batch = formatted.slice(i, i + BATCH_SIZE);
+  if (batch.length > 0) {
     const messages = batch.map(recipient => ({
       recipient,
       message: message.trim(),
       ref: uuidv4(),
     }));
-
     try {
       const response = await fetch(MOOLRE_SMS_URL, {
         method: 'POST',
-        headers: {
-          'X-API-VASKEY':  vasKey,
-          'Content-Type': 'application/json',
-        },
+        headers: { 'X-API-VASKEY': vasKey, 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 1, senderid: SENDER_ID, messages }),
       });
       const data = await response.json();
       console.log('[Moolre SMS] Batch response:', JSON.stringify(data));
       if (data.status === 1) sent += batch.length;
-      else { failed += batch.length; console.error('[Moolre SMS] Batch failed:', JSON.stringify(data)); }
+      else { failed += batch.length; console.error('[Moolre SMS] Failed:', JSON.stringify(data)); }
     } catch (err) {
       console.error('[Moolre SMS] Batch error:', err.message);
       failed += batch.length;
     }
   }
 
-  return res.status(200).json({ success: true, total: formatted.length, sent, failed });
+  return res.status(200).json({
+    success: true,
+    total: allFormatted.length,
+    sent,
+    failed,
+    nextOffset: remaining > 0 ? offset + BATCH_SIZE : null,
+    remaining,
+  });
 }
