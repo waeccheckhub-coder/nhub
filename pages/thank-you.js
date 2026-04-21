@@ -48,10 +48,12 @@ export default function ThankYou() {
       }
     }
 
-    verifyPayment(order);
+    // Get provider from URL param or stored order
+    const urlProvider = router.query.provider || 'hubtel';
+    verifyPayment(order, urlProvider);
   }, [router.isReady, ref]);
 
-  const verifyPayment = async (order) => {
+  const verifyPayment = async (order, provider = 'hubtel') => {
     setVerifying(true);
     setError(null);
     try {
@@ -61,6 +63,7 @@ export default function ThankYou() {
         type: order?.type || '',
         phone: order?.phone || '',
         name: order?.name || '',
+        provider: order?.provider || provider,
       });
 
       if (res.data.preorder) {
@@ -84,7 +87,9 @@ export default function ThankYou() {
       const { phone, type, qty, name } = router.query;
       if (phone && type) order = { reference: ref, phone, type, quantity: qty || 1, name: name || '' };
     } catch (_) {}
-    verifyPayment(order);
+    // Get provider from URL param or stored order
+    const urlProvider = router.query.provider || 'hubtel';
+    verifyPayment(order, urlProvider);
   };
 
   const getPortalDetails = (type) => {
