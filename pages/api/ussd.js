@@ -14,6 +14,7 @@
 // RESPONSE: { message: string, reply: boolean }
 
 import pool from '../../lib/db';
+import { initHubtelDirectDebit } from '../../lib/hubtel';
 import { getPrices } from '../../lib/settings';
 import { sendAdminAlert } from '../../lib/alerts';
 import { sendVoucherSMS, sendPreorderSMS } from '../../lib/sms';
@@ -600,31 +601,57 @@ export default async function handler(req, res) {
                            msisdn.startsWith('+233') ? '0' + msisdn.slice(4)  :
                            msisdn;
 
-        // Trigger MoMo PIN prompt
+        // Trigger MoMo PIN prompt via Hubtel (primary) with Moolre fallback
+        // Map USSD network to Hubtel/Moolre channel names
+        const networkNameMap = { 3: 'MTN', 5: 'AT', 6: 'TELECEL' };
+        const networkName = networkNameMap[network] || 'MTN';
+
+        let paymentTriggered = false;
+
+        // ── Hubtel direct debit (primary) ─────────────────────────────────
         try {
-          const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
-            method: 'POST',
-            headers: {
-              'X-API-USER':   process.env.MOOLRE_USERNAME,
-              'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              type:          1,
-              channel,
-              currency:      'GHS',
-              payer:         payerLocal,
-              amount:        parseFloat(total),
-              externalref:   ref,
-              reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
-              sessionid:     sessionId,
-              accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
-            }),
+          await initHubtelDirectDebit({
+            phone:       payerLocal,
+            amount:      parseFloat(total),
+            reference:   ref,
+            description: `${quantity}x ${voucherType} - WAEC GH Checkers`,
+            network:     networkName,
           });
-          const payData = await payRes.json();
-          console.log('[USSD] Moolre payment response:', JSON.stringify(payData));
-        } catch (payErr) {
-          console.error('[USSD] Moolre payment error:', payErr.message);
+          console.log('[USSD] Hubtel direct debit triggered for', ref);
+          paymentTriggered = true;
+        } catch (hubtelErr) {
+          console.error('[USSD] Hubtel direct debit failed, trying Moolre:', hubtelErr.message);
+        }
+
+        // ── Moolre fallback ───────────────────────────────────────────────
+        if (!paymentTriggered) {
+          try {
+            const networkToChannel = { 3: '13', 5: '7', 6: '6' };
+            const channel = networkToChannel[network] || '13';
+            const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
+              method: 'POST',
+              headers: {
+                'X-API-USER':   process.env.MOOLRE_USERNAME,
+                'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                type:          1,
+                channel,
+                currency:      'GHS',
+                payer:         payerLocal,
+                amount:        parseFloat(total),
+                externalref:   ref,
+                reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
+                sessionid:     sessionId,
+                accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+              }),
+            });
+            const payData = await payRes.json();
+            console.log('[USSD] Moolre fallback response:', JSON.stringify(payData));
+          } catch (moolreErr) {
+            console.error('[USSD] Moolre fallback also failed:', moolreErr.message);
+          }
         }
 
         // Poll for payment status as fallback — Moolre may not fire a webhook
