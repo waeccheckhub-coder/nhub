@@ -22,7 +22,8 @@ export default async function handler(req, res) {
     const unitPrice = prices[type] || 30;
     const qty = parseInt(quantity);
     const amount = unitPrice * qty;
-    const reference = `WAEC-${type}-${Date.now()}-${uuidv4().slice(0, 8).toUpperCase()}`;
+    // Reference must be alphanumeric, max 32 chars (Hubtel requirement)
+    const reference = (`WAEC${type}${Date.now()}${uuidv4().slice(0, 8)}`).replace(/[^a-zA-Z0-9]/g, '').slice(0, 32).toUpperCase();
     const baseUrl = process.env.NEXT_PUBLIC_BASE_URL;
 
     // Save initiated order to DB before redirecting
