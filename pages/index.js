@@ -20,6 +20,7 @@ export default function Home() {
   const [prices, setPrices] = useState({ WASSCE: 30, BECE: 30 });
   const [supportWhatsapp, setSupportWhatsapp] = useState('');
   const [allowPreorder, setAllowPreorder] = useState(false);
+  const [provider, setProvider] = useState('hubtel'); // hubtel | moolre
 
   useEffect(() => {
     setHasMounted(true);
@@ -47,7 +48,7 @@ export default function Home() {
     const t = toast.loading('Initializing payment...');
     try {
       const res = await axios.post('/api/init-payment', {
-        phone, name, quantity: qty, type: voucherType, network
+        phone, name, quantity: qty, type: voucherType, network, provider
       });
 
       toast.dismiss(t);
@@ -56,7 +57,7 @@ export default function Home() {
         // Store order in localStorage (primary) — thank-you page reads this
         try {
           localStorage.setItem('pendingOrder', JSON.stringify({
-            reference: res.data.reference, quantity: qty, type: voucherType, phone, name,
+            reference: res.data.reference, quantity: qty, type: voucherType, phone, name, provider: res.data.provider || provider,
           }));
         } catch (_) {}
         // Also embed order details in the return URL as fallback for when localStorage is unavailable
@@ -65,7 +66,7 @@ export default function Home() {
         // We stash params in sessionStorage too as secondary fallback.
         try {
           sessionStorage.setItem('pendingOrder', JSON.stringify({
-            reference: res.data.reference, quantity: qty, type: voucherType, phone, name,
+            reference: res.data.reference, quantity: qty, type: voucherType, phone, name, provider: res.data.provider || provider,
           }));
         } catch (_) {}
         window.location.href = base;
@@ -128,7 +129,7 @@ export default function Home() {
             Buy WASSCE & BECE <span className="text-[#4f46e5]">Instantly</span>
           </h1>
           <p className="text-[#64748b] text-lg mb-2">Authentic WAEC result checkers delivered via SMS. Pay with Mobile Money.</p>
-          <p className="text-sm text-[#64748b]">Powered by <strong>Moolre</strong> — MTN MoMo, Telecel Cash, AT Money accepted</p>
+          <p className="text-sm text-[#64748b]">Powered by <strong>Hubtel</strong> &amp; <strong>Moolre</strong> — MTN MoMo, Telecel Cash, AT Money accepted</p>
         </section>
 
         {/* Shared Fields */}
@@ -150,6 +151,21 @@ export default function Home() {
                 <option value="TELECEL">Telecel Cash</option>
                 <option value="AT">AT Money</option>
               </select>
+            </div>
+            <div>
+              <label className="label">Payment Provider</label>
+              <div className="flex gap-2 mt-1">
+                {[
+                  { id: 'hubtel', label: 'Hubtel', sub: 'Recommended' },
+                  { id: 'moolre', label: 'Moolre', sub: 'Alternative' },
+                ].map(p => (
+                  <button key={p.id} type="button" onClick={() => setProvider(p.id)}
+                    className={`flex-1 py-2.5 px-3 rounded-xl border-2 text-xs font-bold transition-all text-left ${provider === p.id ? 'border-[#4f46e5] bg-[#4f46e5]/5 text-[#4f46e5]' : 'border-[#e2e8f0] text-[#64748b] hover:border-[#4f46e5]/30'}`}>
+                    {p.label}
+                    <span className="block text-[9px] font-semibold opacity-60 mt-0.5">{p.sub}</span>
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
         </div>
@@ -209,7 +225,7 @@ export default function Home() {
                         ${isPaying ? 'opacity-70 cursor-wait' : 'hover:-translate-y-0.5 active:translate-y-0'}
                         bg-gradient-to-br ${vt.color} shadow-lg`}
                     >
-                      {isPaying ? 'Redirecting to Moolre...' : isPreorder ? `Pre-Order — Pay GHS ${price * qty}` : `Pay GHS ${price * qty} via Moolre`}
+                      {isPaying ? `Redirecting to ${provider === 'moolre' ? 'Moolre' : 'Hubtel'}...` : isPreorder ? `Pre-Order — Pay GHS ${price * qty}` : `Pay GHS ${price * qty}`}
                     </button>
                   )}
                 </div>
@@ -249,8 +265,8 @@ export default function Home() {
           <section id="howitworks" className="glass-card p-6">
             <h3 className="font-bold mb-3">How it works</h3>
             <ol className="text-sm text-[#64748b] space-y-2 ml-4 list-decimal">
-              <li>Fill your details above and click "Pay via Moolre".</li>
-              <li>You'll be redirected to Moolre's secure page — pay with MoMo, Telecel, or AT Money.</li>
+              <li>Fill your details above and choose your preferred payment provider (Hubtel is recommended).</li>
+              <li>You'll be redirected to a secure checkout page — pay with MoMo, Telecel, or AT Money.</li>
               <li>After payment, voucher(s) are delivered instantly via SMS.</li>
               <li>Out of stock? Pre-order and receive when restocked!</li>
             </ol>
@@ -259,7 +275,7 @@ export default function Home() {
             <h3 className="font-bold mb-3">FAQ</h3>
             <div className="text-sm text-[#64748b] space-y-2">
               <p><strong>Delivery Time:</strong> Instant after payment confirmation.</p>
-              <p><strong>Payment Methods:</strong> MTN MoMo, Telecel Cash, AT Money via Moolre.</p>
+              <p><strong>Payment Methods:</strong> MTN MoMo, Telecel Cash, AT Money via Hubtel or Moolre.</p>
               <p><strong>Didn't receive SMS?</strong> Use the Retrieve section above with your phone number.</p>
               <p><strong>Out of stock?</strong> Pre-order — you'll get vouchers as soon as they're uploaded!</p>
             </div>
@@ -278,7 +294,7 @@ export default function Home() {
               Chat with Support on WhatsApp
             </a>
           )}
-          © 2025 WAEC GH Cards Online. Securely Powered by <strong>Moolre</strong>.
+          © 2025 WAEC GH Cards Online. Securely Powered by <strong>Hubtel</strong> &amp; <strong>Moolre</strong>.
         </footer>
       </div>
 
