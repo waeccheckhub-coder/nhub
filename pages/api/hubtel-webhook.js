@@ -53,7 +53,7 @@ export default async function handler(req, res) {
     let phone, qty, voucherType, orderAmount;
 
     const preorderRow = await pool.query(
-      `SELECT phone, quantity, voucher_type, amount FROM preorders WHERE reference=$1 OR reference=SUBSTRING($1, 1, 32)`,
+      `SELECT phone, quantity, voucher_type, amount FROM preorders WHERE reference=$1`,
       [reference]
     );
     if (preorderRow.rowCount > 0) {
@@ -61,7 +61,7 @@ export default async function handler(req, res) {
       console.log('[Hubtel Webhook] Order from preorders:', { phone, qty, voucherType });
     } else {
       const txRow = await pool.query(
-        `SELECT phone, quantity, voucher_type, amount FROM transactions WHERE reference=$1 OR reference=SUBSTRING($1, 1, 32)`,
+        `SELECT phone, quantity, voucher_type, amount FROM transactions WHERE reference=$1`,
         [reference]
       );
       if (txRow.rowCount > 0) {
