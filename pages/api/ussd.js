@@ -33,6 +33,79 @@ export const config = {
   api: { bodyParser: false },
 };
 
+// ── SV USSD Proxy ─────────────────────────────────────────────────────────────
+// When a user dials *xxx*xxx*7#, Wigal sends mode=START with userdata="7".
+// All traffic for those sessions is forwarded to the SV data-bundle service.
+//
+// Set SV_USSD_URL in your .env.local, e.g.:
+//   SV_USSD_URL=https://sv.yourdomain.com/api/ussd
+//
+// SV uses Wigal V2 (POST JSON); nhub uses Wigal V1 (GET + pipe string).
+// This function bridges the two protocols in both directions.
+
+const SV_USSD_URL = process.env.SV_USSD_URL;
+
+async function proxyToSv({ network, sessionid, mode, msisdn, userdata, username, trafficid, other }) {
+  if (!SV_USSD_URL) {
+    console.error('[USSD] SV_USSD_URL is not configured — cannot proxy *7 sessions');
+    return null;
+  }
+
+  // Build the V2 JSON body that SV's POST handler expects.
+  // SV accepts both "phonenumber" (V2) and "msisdn" (V1) — send both to be safe.
+  const body = {
+    network,
+    sessionid,
+    mode:        mode.toUpperCase(), // START | MORE | END
+    phonenumber: msisdn,
+    msisdn,
+    userdata,
+    username,
+    trafficid,
+    other: other ?? '',
+  };
+
+  console.log(`[USSD] Proxying to SV (${mode}):`, JSON.stringify(body));
+
+  try {
+    const res = await fetch(SV_USSD_URL, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      console.error('[USSD] SV proxy returned HTTP', res.status);
+      return null;
+    }
+
+    // SV responds with a JSON object: { network, sessionid, mode, msisdn, userdata, username, trafficid, other }
+    const json = await res.json();
+    console.log('[USSD] SV proxy response:', JSON.stringify(json));
+
+    // Convert back to the V1 pipe string that Wigal expects from nhub.
+    // SV uses \n as newline; Wigal V1 uses ^ as newline.  Pipe chars are illegal in userdata.
+    const safeUserdata = String(json.userdata ?? '')
+      .replace(/\n/g, '^')
+      .replace(/\|/g, ' ');
+
+    return [
+      json.network   ?? network,
+      json.mode      ?? 'END',
+      json.msisdn    ?? msisdn,
+      json.sessionid ?? sessionid,
+      safeUserdata,
+      json.username  ?? username,
+      json.trafficid ?? trafficid,
+      json.other     ?? other ?? '',
+    ].join('|');
+
+  } catch (err) {
+    console.error('[USSD] SV proxy fetch error:', err.message);
+    return null;
+  }
+}
+
 // ── DB session helpers ────────────────────────────────────────────────────────
 
 async function ensureTable() {
@@ -300,10 +373,51 @@ export default async function handler(req, res) {
   try {
     const prices = await getPrices();
 
-    const isNewSession   = mode === 'START';
+    const isNewSession    = mode === 'START';
     const existingSession = isNewSession ? null : await getSession(sessionid);
 
     console.log(`[USSD] isNewSession=${isNewSession} existingStage=${existingSession?.stage ?? 'none'}`);
+
+    // ── *7 shortcode → proxy to SV data-bundle USSD ──────────────────────────
+    // Dialling *xxx*xxx*7# makes Wigal send mode=START with userdata="7".
+    // We mark the session as SV_PROXY and forward every request from here on.
+
+    if (isNewSession && userdata === '7') {
+      // Mark session so all follow-up inputs are forwarded too.
+      await setSession(sessionid, { stage: 'SV_PROXY' });
+      // Forward the START to SV with empty userdata (the "7" was just routing).
+      const svReply = await proxyToSv({
+        network, sessionid, mode: 'START', msisdn,
+        userdata: '', username, trafficid, other,
+      });
+      if (svReply) {
+        // If SV already closed the session (unlikely on START but be safe), clean up.
+        if (svReply.split('|')[1] === 'END') await clearSession(sessionid);
+        res.setHeader('Content-Type', 'text/plain');
+        return res.status(200).send(svReply);
+      }
+      return endSession('DataBundles service is unavailable. Please try again.');
+    }
+
+    if (!isNewSession && existingSession?.stage === 'SV_PROXY') {
+      // ── END notification — forward to SV then clean up ──────────────────
+      if (mode === 'END') {
+        await proxyToSv({ network, sessionid, mode: 'END', msisdn, userdata, username, trafficid, other });
+        await clearSession(sessionid);
+        res.setHeader('Content-Type', 'text/plain');
+        return res.status(200).send('');
+      }
+
+      // ── Regular input — forward to SV ────────────────────────────────────
+      const svReply = await proxyToSv({ network, sessionid, mode, msisdn, userdata, username, trafficid, other });
+      if (svReply) {
+        // SV returned mode=END → clean up proxy session record.
+        if (svReply.split('|')[1] === 'END') await clearSession(sessionid);
+        res.setHeader('Content-Type', 'text/plain');
+        return res.status(200).send(svReply);
+      }
+      return endSession('DataBundles service is unavailable. Please try again.');
+    }
 
     // ── New session → show main menu ─────────────────────────────────────────
     if (isNewSession || existingSession === null) {
