@@ -379,10 +379,13 @@ export default async function handler(req, res) {
     console.log(`[USSD] isNewSession=${isNewSession} existingStage=${existingSession?.stage ?? 'none'}`);
 
     // ── *7 shortcode → proxy to SV data-bundle USSD ──────────────────────────
-    // Dialling *xxx*xxx*7# makes Wigal send mode=START with userdata="7".
+    // Dialling *xxx*xxx*7# makes Wigal send mode=START with userdata ending in "*7"
+    // (e.g. "xxxx*7") — or just "7" on some network configs. Match both.
     // We mark the session as SV_PROXY and forward every request from here on.
 
-    if (isNewSession && userdata === '7') {
+    const isSvShortcode = isNewSession && /(?:^|\*)7$/.test(userdata);
+
+    if (isSvShortcode) {
       // Mark session so all follow-up inputs are forwarded too.
       await setSession(sessionid, { stage: 'SV_PROXY' });
       // Forward the START to SV with empty userdata (the "7" was just routing).
