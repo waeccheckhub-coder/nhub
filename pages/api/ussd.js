@@ -1,19 +1,22 @@
-// POST /api/ussd — Wigal Frog Smart USSD callback handler with DB-backed sessions
+// GET /api/ussd — Wigal Smart USSD callback handler with DB-backed sessions
 //
-// Wigal Frog sends a POST with JSON body. newSession=true on the first hit.
-// We respond with JSON. continueSession=true keeps the menu open; false closes it.
+// Smart USSD sends a GET with query parameters on every interaction.
+// We respond with a pipe-delimited plain-text string.
 //
-// WIGAL FROG INBOUND FIELDS:
-//   sessionId     — unique session identifier for this USSD dialogue
-//   newSession    — boolean; true on the very first request of a session
-//   msisdn        — customer phone e.g. "233241235993"
-//   network       — network name string e.g. "MTN", "AT", "TELECEL"
-//   userInput     — what the customer typed (empty string on first hit)
+// WIGAL SMART USSD INBOUND QUERY PARAMS:
+//   network     — originating network e.g. "wigal_mtn_gh"
+//   sessionid   — unique session identifier for this USSD dialogue
+//   mode        — "start" (new session) | "MORE" (awaiting input) | "END" (close)
+//   msisdn      — customer phone e.g. "233241235993"
+//   userdata    — what the customer typed (empty string on first hit)
+//   username    — WIGAL username (echo back as-is)
+//   trafficid   — unique per-request ID (echo back as-is)
+//   other       — optional reference data (echo back as-is)
 //
-// WIGAL FROG OUTBOUND FIELDS:
-//   sessionId       — echo back as received
-//   continueSession — true = keep session open (MORE), false = end session (END)
-//   message         — text to display on the customer's handset
+// WIGAL SMART USSD OUTBOUND RESPONSE FORMAT (pipe-delimited string):
+//   NETWORK|MODE|MSISDN|SESSIONID|USERDATA|USERNAME|TRAFFICID|OTHER
+//   MODE must be MORE (keep open) or END (close session)
+//   Use ^ as newline in USERDATA. Max 160 chars total in USERDATA.
 //
 // PAYMENT WEBHOOKS:
 //   Hubtel sends confirmations to /api/hubtel-webhook (separate endpoint).
@@ -25,8 +28,10 @@ import { getPrices } from '../../lib/settings';
 import { sendAdminAlert } from '../../lib/alerts';
 import { sendVoucherSMS, sendPreorderSMS } from '../../lib/sms';
 
-// Next.js default body parser handles JSON fine for Wigal Frog
-// (they POST application/json), so we leave bodyParser enabled.
+// Smart USSD sends GET requests, so disable Next.js body parsing
+export const config = {
+  api: { bodyParser: false },
+};
 
 // ── DB session helpers ────────────────────────────────────────────────────────
 
@@ -220,72 +225,90 @@ async function pollAndFulfill({ ref, phone, voucherType, quantity, total }) {
 }
 
 // ── Network name → Hubtel channel ─────────────────────────────────────────────
-// Wigal Frog passes the network as a human-readable string.
+// Smart USSD passes network as e.g. "wigal_mtn_gh", "wigal_at_gh", "wigal_telecel_gh"
 
 function networkToHubtelName(network) {
   const n = String(network || '').toUpperCase();
-  if (n.includes('MTN'))                       return 'MTN';
+  if (n.includes('MTN'))                               return 'MTN';
   if (n.includes('AT') || n.includes('AIRTEL') || n.includes('TIGO')) return 'AT';
-  if (n.includes('TELECEL') || n.includes('VODA')) return 'TELECEL';
+  if (n.includes('TELECEL') || n.includes('VODA'))     return 'TELECEL';
   return 'MTN'; // safe default
+}
+
+// ── Smart USSD response builder ───────────────────────────────────────────────
+// Builds the required pipe-delimited response string.
+// USERDATA uses ^ as newline (max 160 chars).
+// mode should be 'MORE' (keep open) or 'END' (close session).
+
+function buildResponse({ network, mode, msisdn, sessionid, userdata, username, trafficid, other }) {
+  // Replace \n with ^ for USSD display, strip any pipe chars from message content
+  const safeUserdata = String(userdata)
+    .replace(/\n/g, '^')
+    .replace(/\|/g, ' ');
+  return `${network}|${mode}|${msisdn}|${sessionid}|${safeUserdata}|${username}|${trafficid}|${other}`;
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
-  if (req.method === 'GET') return res.status(200).json({ status: 'ok' });
-  if (req.method !== 'POST') return res.status(405).end();
+  // Smart USSD uses GET requests
+  if (req.method === 'POST') return res.status(200).send('ok');
+  if (req.method !== 'GET')  return res.status(405).end();
 
-  const body = req.body || {};
+  const q = req.query;
 
-  console.log('[USSD] body:', JSON.stringify(body));
+  console.log('[USSD] query:', JSON.stringify(q));
 
-  // ── Parse Wigal Frog fields ────────────────────────────────────────────────
-  const sessionId  = String(body.sessionId  ?? body.session_id ?? '').trim();
-  const msisdn     = String(body.msisdn     ?? body.phonenumber ?? body.phoneNumber ?? '').trim();
-  const networkRaw = String(body.network    ?? '').trim();
-  const isNew      = body.newSession === true || body.newSession === 'true' ||
-                     body.new        === true || body.new        === 'true';
+  // ── Parse Smart USSD fields ────────────────────────────────────────────────
+  const network   = String(q.network   ?? '').trim();
+  const sessionid = String(q.sessionid ?? '').trim();
+  const mode      = String(q.mode      ?? '').trim().toUpperCase(); // START | MORE | END
+  const msisdn    = String(q.msisdn    ?? '').trim();
+  const userdata  = String(q.userdata  ?? '').trim();
+  const username  = String(q.username  ?? '').trim();
+  const trafficid = String(q.trafficid ?? '').trim();
+  const other     = String(q.other     ?? '').trim();
 
-  // userInput is empty string on first hit; just the single digit on subsequent hits
-  const userInput  = String(body.userInput  ?? body.userdata ?? '').trim();
+  console.log(`[USSD] sessionid="${sessionid}" mode=${mode} msisdn="${msisdn}" input="${userdata}" network="${network}"`);
 
-  console.log(`[USSD] sessionId="${sessionId}" isNew=${isNew} msisdn="${msisdn}" input="${userInput}" network="${networkRaw}"`);
-
-  if (!sessionId) {
-    console.error('[USSD] Missing sessionId:', JSON.stringify(body));
-    return res.status(200).json({
-      sessionId:       sessionId || 'unknown',
-      continueSession: false,
-      message:         'Session error. Please try again.',
+  // ── Response helpers ───────────────────────────────────────────────────────
+  const sendText = (text, keepOpen = true) => {
+    const responseMode = keepOpen ? 'MORE' : 'END';
+    const responseStr  = buildResponse({
+      network, mode: responseMode, msisdn, sessionid,
+      userdata: text, username, trafficid, other,
     });
-  }
-
-  // ── Wigal Frog response helper ─────────────────────────────────────────────
-  // continueSession=true  → MORE (keep menu open, wait for input)
-  // continueSession=false → END  (close session)
-  const respond = async (message, keepOpen = true) => {
-    if (!keepOpen) await clearSession(sessionId);
-    console.log(`[USSD] continueSession=${keepOpen}: ${String(message).replace(/\n/g, '|').slice(0, 120)}`);
-    return res.status(200).json({
-      sessionId,
-      continueSession: keepOpen,
-      message,
-    });
+    console.log(`[USSD] response (${responseMode}): ${responseStr.slice(0, 160)}`);
+    res.setHeader('Content-Type', 'text/plain');
+    return res.status(200).send(responseStr);
   };
+
+  const endSession = async (text) => {
+    await clearSession(sessionid);
+    return sendText(text, false);
+  };
+
+  if (!sessionid) {
+    console.error('[USSD] Missing sessionid:', JSON.stringify(q));
+    res.setHeader('Content-Type', 'text/plain');
+    return res.status(200).send(
+      buildResponse({ network, mode: 'END', msisdn, sessionid: 'unknown',
+        userdata: 'Session error. Please try again.', username, trafficid, other })
+    );
+  }
 
   try {
     const prices = await getPrices();
 
-    const existingSession = await getSession(sessionId);
-    const isNewSession    = isNew || existingSession === null;
+    const isNewSession   = mode === 'START';
+    const existingSession = isNewSession ? null : await getSession(sessionid);
 
     console.log(`[USSD] isNewSession=${isNewSession} existingStage=${existingSession?.stage ?? 'none'}`);
 
     // ── New session → show main menu ─────────────────────────────────────────
-    if (isNewSession) {
-      await setSession(sessionId, { stage: 'MENU' });
-      return respond(
+    if (isNewSession || existingSession === null) {
+      await setSession(sessionid, { stage: 'MENU' });
+      return sendText(
         `Welcome to WAEC GH Checkers\n` +
         `1. WASSCE (GHS ${prices.WASSCE})\n` +
         `2. BECE (GHS ${prices.BECE})\n` +
@@ -294,8 +317,16 @@ export default async function handler(req, res) {
       );
     }
 
+    // ── END mode — customer closed the session on their handset ──────────────
+    if (mode === 'END') {
+      await clearSession(sessionid);
+      // No response needed for END; Wigal just notifies us the session closed
+      res.setHeader('Content-Type', 'text/plain');
+      return res.status(200).send('');
+    }
+
     const session = existingSession;
-    const choice  = userInput;
+    const choice  = userdata; // digit(s) the customer typed
 
     console.log(`[USSD] stage="${session.stage}" choice="${choice}"`);
 
@@ -304,16 +335,16 @@ export default async function handler(req, res) {
       // ── Main menu ──────────────────────────────────────────────────────────
       case 'MENU': {
         const typeMap = { '1': 'WASSCE', '2': 'BECE' };
-        if (choice === '0') return respond('Thank you. Goodbye!', false);
+        if (choice === '0') return endSession('Thank you. Goodbye!');
         if (!typeMap[choice]) {
-          return respond(
+          return sendText(
             `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n0. Exit`,
             true
           );
         }
         const voucherType = typeMap[choice];
-        await setSession(sessionId, { stage: 'SELECT_QTY', voucherType });
-        return respond(
+        await setSession(sessionid, { stage: 'SELECT_QTY', voucherType });
+        return sendText(
           `${voucherType} @ GHS ${prices[voucherType]} each.\nHow many? (1-5)`,
           true
         );
@@ -323,12 +354,12 @@ export default async function handler(req, res) {
       case 'SELECT_QTY': {
         const qty = parseInt(choice, 10);
         if (!qty || qty < 1 || qty > 5) {
-          return respond('Please enter a number between 1 and 5:', true);
+          return sendText('Please enter a number between 1 and 5:', true);
         }
         const unitPrice = parseFloat(prices[String(session.voucherType)] || 0);
         const total     = (unitPrice * qty).toFixed(2);
-        await setSession(sessionId, { stage: 'CONFIRM', voucherType: session.voucherType, quantity: qty });
-        return respond(
+        await setSession(sessionid, { stage: 'CONFIRM', voucherType: session.voucherType, quantity: qty });
+        return sendText(
           `${qty}x ${session.voucherType} = GHS ${total}\nMoMo: ${msisdn}\n\n1. Confirm & Pay\n2. Cancel`,
           true
         );
@@ -336,8 +367,8 @@ export default async function handler(req, res) {
 
       // ── Order confirmation ─────────────────────────────────────────────────
       case 'CONFIRM': {
-        if (choice === '2') return respond('Cancelled. Goodbye!', false);
-        if (choice !== '1') return respond('Press 1 to confirm or 2 to cancel:', true);
+        if (choice === '2') return endSession('Cancelled. Goodbye!');
+        if (choice !== '1') return sendText('Press 1 to confirm or 2 to cancel:', true);
 
         const voucherType = session.voucherType ? String(session.voucherType) : null;
         const quantity    = session.quantity    ? parseInt(session.quantity, 10) : 0;
@@ -346,10 +377,10 @@ export default async function handler(req, res) {
 
         if (!voucherType || !quantity) {
           console.error('[USSD] CONFIRM: missing session data', JSON.stringify(session));
-          return respond('Session expired. Please dial again.', false);
+          return endSession('Session expired. Please dial again.');
         }
 
-        const safeSuffix = String(sessionId).replace(/\W/g, '').slice(-6).toUpperCase() || 'USSD';
+        const safeSuffix = String(sessionid).replace(/\W/g, '').slice(-6).toUpperCase() || 'USSD';
         const ref        = `USSD-${Date.now()}-${safeSuffix}`;
 
         // ── Reserve vouchers / create preorder ────────────────────────────
@@ -403,7 +434,7 @@ export default async function handler(req, res) {
           await client.query('ROLLBACK');
           client.release();
           console.error('[USSD] CONFIRM DB error:', dbErr.message);
-          return respond('An error occurred. Please try again.', false);
+          return endSession('An error occurred. Please try again.');
         }
 
         // ── Trigger MoMo PIN prompt ────────────────────────────────────────
@@ -412,7 +443,7 @@ export default async function handler(req, res) {
                            msisdn.startsWith('+233') ? '0' + msisdn.slice(4)  :
                            msisdn;
 
-        const networkName = networkToHubtelName(networkRaw);
+        const networkName = networkToHubtelName(network);
 
         let paymentTriggered = false;
 
@@ -451,7 +482,7 @@ export default async function handler(req, res) {
                 amount:        parseFloat(total),
                 externalref:   ref,
                 reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
-                sessionid:     sessionId,
+                sessionid:     sessionid,
                 accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
               }),
             });
@@ -466,16 +497,15 @@ export default async function handler(req, res) {
         pollAndFulfill({ ref, phone: msisdn, voucherType, quantity, total });
 
         // Close the USSD session — customer now approves on MoMo prompt
-        return respond(
-          `Please authorize the GHS ${total} MoMo payment on your phone.\nYour voucher PIN will be sent by SMS once payment is confirmed.`,
-          false // END session — no more USSD input needed
+        return endSession(
+          `Please authorize the GHS ${total} MoMo payment on your phone. Your voucher PIN will be sent by SMS once payment is confirmed.`
         );
       }
 
       // ── Unknown stage — reset ──────────────────────────────────────────────
       default:
-        await setSession(sessionId, { stage: 'MENU' });
-        return respond(
+        await setSession(sessionid, { stage: 'MENU' });
+        return sendText(
           `WAEC GH Checkers\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n0. Exit`,
           true
         );
@@ -483,10 +513,10 @@ export default async function handler(req, res) {
 
   } catch (err) {
     console.error('[USSD] Unhandled error:', err.message, err.stack);
-    return res.status(200).json({
-      sessionId,
-      continueSession: false,
-      message: 'Service error. Please try again.',
-    });
+    res.setHeader('Content-Type', 'text/plain');
+    return res.status(200).send(
+      buildResponse({ network, mode: 'END', msisdn, sessionid,
+        userdata: 'Service error. Please try again.', username, trafficid, other })
+    );
   }
 }
