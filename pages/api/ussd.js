@@ -1,45 +1,109 @@
-// POST /api/ussd — Moolre USSD callback handler with DB-backed sessions
+// GET /api/ussd — Wigal Smart USSD callback handler with DB-backed sessions
 //
-// Moolre uses ONE callback URL per account — so payment webhooks also
-// arrive here. We detect them by checking for body.data.txstatus and
-// route them to the webhook fulfillment logic.
+// Smart USSD sends a GET with query parameters on every interaction.
+// We respond with a pipe-delimited plain-text string.
 //
-// MOOLRE USSD FIELDS:
-//   sessionId  — unique session ID
-//   new        — true/1/"true"/"1" on first request
-//   msisdn     — customer phone e.g. "233241235993"
-//   network    — 3=MTN, 5=AT, 6=Telecel
-//   message    — accumulated input e.g. "1*2*1"
+// WIGAL SMART USSD INBOUND QUERY PARAMS:
+//   network     — originating network e.g. "wigal_mtn_gh"
+//   sessionid   — unique session identifier for this USSD dialogue
+//   mode        — "start" (new session) | "MORE" (awaiting input) | "END" (close)
+//   msisdn      — customer phone e.g. "233241235993"
+//   userdata    — what the customer typed (empty string on first hit)
+//   username    — WIGAL username (echo back as-is)
+//   trafficid   — unique per-request ID (echo back as-is)
+//   other       — optional reference data (echo back as-is)
 //
-// RESPONSE: { message: string, reply: boolean }
+// WIGAL SMART USSD OUTBOUND RESPONSE FORMAT (pipe-delimited string):
+//   NETWORK|MODE|MSISDN|SESSIONID|USERDATA|USERNAME|TRAFFICID|OTHER
+//   MODE must be MORE (keep open) or END (close session)
+//   Use ^ as newline in USERDATA. Max 160 chars total in USERDATA.
+//
+// PAYMENT WEBHOOKS:
+//   Hubtel sends confirmations to /api/hubtel-webhook (separate endpoint).
+//   This endpoint is USSD-only — no payment webhook detection needed here.
 
 import pool from '../../lib/db';
+import { initHubtelDirectDebit } from '../../lib/hubtel';
 import { getPrices } from '../../lib/settings';
 import { sendAdminAlert } from '../../lib/alerts';
 import { sendVoucherSMS, sendPreorderSMS } from '../../lib/sms';
 
-// CRITICAL: disable Next.js body parser — handle all content-types manually
-export const config = { api: { bodyParser: false } };
+// Smart USSD sends GET requests, so disable Next.js body parsing
+export const config = {
+  api: { bodyParser: false },
+};
 
-// ── Body parser ───────────────────────────────────────────────────────────────
+// ── SV USSD Proxy ─────────────────────────────────────────────────────────────
+// When a user dials *xxx*xxx*7#, Wigal sends mode=START with userdata="7".
+// All traffic for those sessions is forwarded to the SV data-bundle service.
+//
+// Set SV_USSD_URL in your .env.local, e.g.:
+//   SV_USSD_URL=https://sv.yourdomain.com/api/ussd
+//
+// SV uses Wigal V2 (POST JSON); nhub uses Wigal V1 (GET + pipe string).
+// This function bridges the two protocols in both directions.
 
-async function parseBody(req) {
-  return new Promise((resolve) => {
-    let raw = '';
-    req.on('data', (chunk) => { raw += chunk.toString(); });
-    req.on('end', () => {
-      if (!raw) return resolve({});
-      try { return resolve(JSON.parse(raw)); } catch (_) {}
-      try {
-        const obj = {};
-        new URLSearchParams(raw).forEach((v, k) => { obj[k] = v; });
-        if (Object.keys(obj).length > 0) return resolve(obj);
-      } catch (_) {}
-      console.warn('[USSD] Could not parse body:', raw.slice(0, 200));
-      return resolve({});
+const SV_USSD_URL = process.env.SV_USSD_URL;
+
+async function proxyToSv({ network, sessionid, mode, msisdn, userdata, username, trafficid, other }) {
+  if (!SV_USSD_URL) {
+    console.error('[USSD] SV_USSD_URL is not configured — cannot proxy *7 sessions');
+    return null;
+  }
+
+  // Build the V2 JSON body that SV's POST handler expects.
+  // SV accepts both "phonenumber" (V2) and "msisdn" (V1) — send both to be safe.
+  const body = {
+    network,
+    sessionid,
+    mode:        mode.toUpperCase(), // START | MORE | END
+    phonenumber: msisdn,
+    msisdn,
+    userdata,
+    username,
+    trafficid,
+    other: other ?? '',
+  };
+
+  console.log(`[USSD] Proxying to SV (${mode}):`, JSON.stringify(body));
+
+  try {
+    const res = await fetch(SV_USSD_URL, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
     });
-    req.on('error', () => resolve({}));
-  });
+
+    if (!res.ok) {
+      console.error('[USSD] SV proxy returned HTTP', res.status);
+      return null;
+    }
+
+    // SV responds with a JSON object: { network, sessionid, mode, msisdn, userdata, username, trafficid, other }
+    const json = await res.json();
+    console.log('[USSD] SV proxy response:', JSON.stringify(json));
+
+    // Convert back to the V1 pipe string that Wigal expects from nhub.
+    // SV uses \n as newline; Wigal V1 uses ^ as newline.  Pipe chars are illegal in userdata.
+    const safeUserdata = String(json.userdata ?? '')
+      .replace(/\n/g, '^')
+      .replace(/\|/g, ' ');
+
+    return [
+      json.network   ?? network,
+      json.mode      ?? 'END',
+      json.msisdn    ?? msisdn,
+      json.sessionid ?? sessionid,
+      safeUserdata,
+      json.username  ?? username,
+      json.trafficid ?? trafficid,
+      json.other     ?? other ?? '',
+    ].join('|');
+
+  } catch (err) {
+    console.error('[USSD] SV proxy fetch error:', err.message);
+    return null;
+  }
 }
 
 // ── DB session helpers ────────────────────────────────────────────────────────
@@ -104,182 +168,13 @@ async function clearSession(sessionId) {
   }
 }
 
-// ── Payment webhook fulfillment ───────────────────────────────────────────────
-// Called when Moolre POSTs a payment confirmation to this URL.
-
-async function handlePaymentWebhook(res, payload) {
-  console.log('[Webhook] Received payload:', JSON.stringify(payload));
-
-  const txData = payload?.data;
-  if (!txData) {
-    console.warn('[Webhook] Empty data field');
-    return res.status(200).json({ received: true });
-  }
-
-  const txstatus  = Number(txData.txstatus);
-  const reference = txData.externalref;
-  const payer     = txData.payer || '';
-  const amount    = txData.amount || 0;
-  const secret    = txData.secret;
-
-  if (process.env.MOOLRE_WEBHOOK_SECRET && secret !== process.env.MOOLRE_WEBHOOK_SECRET) {
-    console.warn('[Webhook] Secret mismatch — ignoring');
-    return res.status(200).json({ received: true });
-  }
-
-  if (txstatus !== 1) {
-    console.log('[Webhook] Non-success txstatus:', txstatus);
-    return res.status(200).json({ received: true, note: 'Non-success txstatus' });
-  }
-
-  if (!reference) {
-    console.warn('[Webhook] No externalref in payload');
-    return res.status(200).json({ received: true });
-  }
-
-  // Idempotency — skip if already fulfilled
-  const existing = await pool.query(
-    `SELECT id FROM transactions WHERE reference=$1 AND status='success'`,
-    [reference]
-  );
-  if (existing.rowCount > 0) {
-    console.log('[Webhook] Already processed:', reference);
-    return res.status(200).json({ received: true, note: 'Already processed' });
-  }
-
-  // Load order — check preorders first, then transactions (USSD saves to transactions)
-  let phone, qty, voucherType, orderAmount;
-
-  const preorderRow = await pool.query(
-    `SELECT phone, quantity, voucher_type, amount FROM preorders WHERE reference=$1`,
-    [reference]
-  );
-
-  if (preorderRow.rowCount > 0) {
-    ({ phone, quantity: qty, voucher_type: voucherType, amount: orderAmount } = preorderRow.rows[0]);
-    console.log('[Webhook] Order found in preorders:', { phone, qty, voucherType });
-  } else {
-    const txRow = await pool.query(
-      `SELECT phone, quantity, voucher_type, amount FROM transactions WHERE reference=$1`,
-      [reference]
-    );
-    if (txRow.rowCount > 0) {
-      ({ phone, quantity: qty, voucher_type: voucherType, amount: orderAmount } = txRow.rows[0]);
-      console.log('[Webhook] Order found in transactions:', { phone, qty, voucherType });
-    } else {
-      phone = payer;
-      qty = 1;
-      voucherType = null;
-      orderAmount = amount;
-    }
-  }
-
-  if (!voucherType) {
-    console.error('[Webhook] Cannot determine voucherType for ref', reference);
-    await sendAdminAlert(
-      `WEBHOOK: Payment received (GHS ${amount}) but order not found! Ref: ${reference}. Phone: ${payer}. Fulfill manually.`
-    );
-    return res.status(200).json({ received: true, note: 'Order not found — admin alerted' });
-  }
-
-  qty = parseInt(qty);
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // Check for vouchers pre-assigned by USSD handler
-    const preAssigned = await client.query(
-      `SELECT id, serial, pin FROM vouchers WHERE transaction_ref=$1 AND status='sold'`,
-      [reference]
-    );
-
-    if (preAssigned.rowCount >= qty) {
-      // USSD pre-assigned them — just confirm payment and send SMS
-      console.log('[Webhook] Vouchers pre-assigned by USSD, confirming payment');
-      await client.query(
-        `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-         VALUES ($1,$2,$3,$4,$5,'success',NOW())
-         ON CONFLICT (reference) DO UPDATE SET status='success'`,
-        [reference, phone, parseFloat(orderAmount), qty, voucherType]
-      );
-      await client.query('COMMIT');
-      client.release();
-
-      await sendVoucherSMS(phone, preAssigned.rows, voucherType);
-      await sendAdminAlert(`✅ USSD Sale: ${qty}x ${voucherType} GHS ${orderAmount} to ${phone}. Ref: ${reference}`);
-      return res.status(200).json({ received: true, fulfilled: true });
-    }
-
-    // No pre-assigned vouchers — assign fresh ones (web payment / preorder flow)
-    const vouchers = await client.query(
-      `SELECT id, serial, pin FROM vouchers
-       WHERE type=$1 AND status='available'
-       LIMIT $2 FOR UPDATE SKIP LOCKED`,
-      [voucherType, qty]
-    );
-
-    if (vouchers.rowCount < qty) {
-      // Out of stock
-      await client.query(
-        `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
-         VALUES ($1,$2,'',$3,$4,$5,'pending',NOW())
-         ON CONFLICT (reference) DO UPDATE SET status='pending'`,
-        [reference, phone, parseFloat(orderAmount), qty, voucherType]
-      );
-      await client.query(
-        `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-         VALUES ($1,$2,$3,$4,$5,'preorder',NOW())
-         ON CONFLICT (reference) DO UPDATE SET status='preorder'`,
-        [reference, phone, parseFloat(orderAmount), qty, voucherType]
-      );
-      await client.query('COMMIT');
-      client.release();
-
-      await sendPreorderSMS(phone, voucherType, reference);
-      await sendAdminAlert(`⚠️ OUT OF STOCK: ${voucherType} x${qty} from ${phone}. Ref: ${reference}. Upload vouchers!`);
-      return res.status(200).json({ received: true, fulfilled: false });
-    }
-
-    const ids = vouchers.rows.map(v => v.id);
-    await client.query(
-      `UPDATE vouchers SET status='sold', sold_to=$1, sold_at=NOW(), transaction_ref=$2 WHERE id=ANY($3)`,
-      [phone, reference, ids]
-    );
-    await client.query(
-      `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-       VALUES ($1,$2,$3,$4,$5,'success',NOW())
-       ON CONFLICT (reference) DO UPDATE SET status='success'`,
-      [reference, phone, parseFloat(orderAmount), qty, voucherType]
-    );
-    await client.query(
-      `UPDATE preorders SET status='fulfilled', fulfilled_at=NOW()
-       WHERE reference=$1 AND status IN ('initiated','pending')`,
-      [reference]
-    );
-    await client.query('COMMIT');
-    client.release();
-
-    await sendVoucherSMS(phone, vouchers.rows, voucherType);
-    await sendAdminAlert(`✅ Web Sale: ${qty}x ${voucherType} GHS ${orderAmount} to ${phone}. Ref: ${reference}`);
-    return res.status(200).json({ received: true, fulfilled: true });
-
-  } catch (err) {
-    await client.query('ROLLBACK');
-    client.release();
-    console.error('[Webhook] DB error:', err.message);
-    return res.status(200).json({ received: true, error: 'Processing failed' });
-  }
-}
-
-
-// ── Poll for payment confirmation ─────────────────────────────────────────────
-// Polls Moolre every 5s for up to 60s after a USSD payment is triggered.
-// Fulfills the order directly if payment confirmed — handles the case where
-// Moolre does not fire a webhook for USSD-triggered direct debit payments.
+// ── Payment polling (background) ──────────────────────────────────────────────
+// Hubtel fires a webhook to /api/hubtel-webhook on payment confirmation.
+// This poll is a safety net in case the webhook is delayed or missed.
+// Polls every 5 s for up to 60 s after the MoMo prompt is sent.
 
 async function pollAndFulfill({ ref, phone, voucherType, quantity, total }) {
-  const maxAttempts = 12; // 12 x 5s = 60s
+  const maxAttempts = 12; // 12 × 5 s = 60 s
   const delay = ms => new Promise(r => setTimeout(r, ms));
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -402,75 +297,135 @@ async function pollAndFulfill({ ref, phone, voucherType, quantity, total }) {
   console.warn('[USSD] Poll timed out for', ref);
 }
 
+// ── Network name → Hubtel channel ─────────────────────────────────────────────
+// Smart USSD passes network as e.g. "wigal_mtn_gh", "wigal_at_gh", "wigal_telecel_gh"
+
+function networkToHubtelName(network) {
+  const n = String(network || '').toUpperCase();
+  if (n.includes('MTN'))                               return 'MTN';
+  if (n.includes('AT') || n.includes('AIRTEL') || n.includes('TIGO')) return 'AT';
+  if (n.includes('TELECEL') || n.includes('VODA'))     return 'TELECEL';
+  return 'MTN'; // safe default
+}
+
+// ── Smart USSD response builder ───────────────────────────────────────────────
+// Builds the required pipe-delimited response string.
+// USERDATA uses ^ as newline (max 160 chars).
+// mode should be 'MORE' (keep open) or 'END' (close session).
+
+function buildResponse({ network, mode, msisdn, sessionid, userdata, username, trafficid, other }) {
+  // Replace \n with ^ for USSD display, strip any pipe chars from message content
+  const safeUserdata = String(userdata)
+    .replace(/\n/g, '^')
+    .replace(/\|/g, ' ');
+  return `${network}|${mode}|${msisdn}|${sessionid}|${safeUserdata}|${username}|${trafficid}|${other}`;
+}
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
-  if (req.method === 'GET') return res.status(200).json({ status: 'ok' });
-  if (req.method !== 'POST') return res.status(405).end();
+  // Smart USSD uses GET requests
+  if (req.method === 'POST') return res.status(200).send('ok');
+  if (req.method !== 'GET')  return res.status(405).end();
 
-  let body = {};
-  try {
-    body = await parseBody(req);
-  } catch (err) {
-    console.error('[USSD] parseBody error:', err.message);
-  }
+  const q = req.query;
 
-  console.log('[USSD] body:', JSON.stringify(body));
+  console.log('[USSD] query:', JSON.stringify(q));
 
-  // ── Detect payment webhook ─────────────────────────────────────────────────
-  // Moolre sends payment confirmations to the account callback URL.
-  // If that's this USSD endpoint, payment webhooks arrive here too.
-  if (body.data && body.data.txstatus !== undefined && body.data.externalref) {
-    console.log('[USSD] Detected payment webhook — routing to fulfillment');
-    return handlePaymentWebhook(res, body);
-  }
+  // ── Parse Smart USSD fields ────────────────────────────────────────────────
+  const network   = String(q.network   ?? '').trim();
+  const sessionid = String(q.sessionid ?? '').trim();
+  const mode      = String(q.mode      ?? '').trim().toUpperCase(); // START | MORE | END
+  const msisdn    = String(q.msisdn    ?? '').trim();
+  const userdata  = String(q.userdata  ?? '').trim();
+  const username  = String(q.username  ?? '').trim();
+  const trafficid = String(q.trafficid ?? '').trim();
+  const other     = String(q.other     ?? '').trim();
 
-  // ── USSD menu flow ─────────────────────────────────────────────────────────
+  console.log(`[USSD] sessionid="${sessionid}" mode=${mode} msisdn="${msisdn}" input="${userdata}" network="${network}"`);
 
-  const sessionId = body.sessionId  != null ? String(body.sessionId).trim()  :
-                    body.session_id != null ? String(body.session_id).trim() :
-                    body.SessionId  != null ? String(body.SessionId).trim()  : '';
-
-  const msisdn    = body.msisdn      != null ? String(body.msisdn).trim()      :
-                    body.phone       != null ? String(body.phone).trim()       :
-                    body.PhoneNumber != null ? String(body.PhoneNumber).trim() : '';
-
-  const network   = body.network != null ? parseInt(body.network, 10) : 3;
-
-  const isNewFlag =
-    body.new   === true || body.new   === 'true' || body.new   === 1 || body.new   === '1' ||
-    body.isNew === true || body.isNew === 'true' || body.isNew === 1 || body.isNew === '1';
-
-  // Moolre sends accumulated input like "1*2*1" — take only the last segment
-  const rawMsg    = body.message ?? body.input ?? body.userInput ?? '';
-  const userInput = String(rawMsg).includes('*')
-    ? String(rawMsg).split('*').pop().trim()
-    : String(rawMsg).trim();
-
-  console.log(`[USSD] sessionId="${sessionId}" isNew=${isNewFlag} msisdn="${msisdn}" input="${userInput}"`);
-
-  if (!sessionId) {
-    console.error('[USSD] Missing sessionId:', JSON.stringify(body));
-    return res.status(200).json({ message: 'Session error. Please try again.', reply: false });
-  }
-
-  const respond = async (message, keepOpen = true) => {
-    if (!keepOpen) await clearSession(sessionId);
-    console.log(`[USSD] reply=${keepOpen}: ${String(message).replace(/\n/g, '|').slice(0, 100)}`);
-    return res.status(200).json({ message, reply: keepOpen });
+  // ── Response helpers ───────────────────────────────────────────────────────
+  const sendText = (text, keepOpen = true) => {
+    const responseMode = keepOpen ? 'MORE' : 'END';
+    const responseStr  = buildResponse({
+      network, mode: responseMode, msisdn, sessionid,
+      userdata: text, username, trafficid, other,
+    });
+    console.log(`[USSD] response (${responseMode}): ${responseStr.slice(0, 160)}`);
+    res.setHeader('Content-Type', 'text/plain');
+    return res.status(200).send(responseStr);
   };
+
+  const endSession = async (text) => {
+    await clearSession(sessionid);
+    return sendText(text, false);
+  };
+
+  if (!sessionid) {
+    console.error('[USSD] Missing sessionid:', JSON.stringify(q));
+    res.setHeader('Content-Type', 'text/plain');
+    return res.status(200).send(
+      buildResponse({ network, mode: 'END', msisdn, sessionid: 'unknown',
+        userdata: 'Session error. Please try again.', username, trafficid, other })
+    );
+  }
 
   try {
     const prices = await getPrices();
 
-    const existingSession = await getSession(sessionId);
-    const isNewSession = isNewFlag || existingSession === null;
+    const isNewSession    = mode === 'START';
+    const existingSession = isNewSession ? null : await getSession(sessionid);
 
     console.log(`[USSD] isNewSession=${isNewSession} existingStage=${existingSession?.stage ?? 'none'}`);
 
-    if (isNewSession) {
-      await setSession(sessionId, { stage: 'MENU' });
-      return respond(
+    // ── *7 shortcode → proxy to SV data-bundle USSD ──────────────────────────
+    // Dialling *xxx*xxx*7# makes Wigal send mode=START with userdata ending in "*7"
+    // (e.g. "xxxx*7") — or just "7" on some network configs. Match both.
+    // We mark the session as SV_PROXY and forward every request from here on.
+
+    const isSvShortcode = isNewSession && /(?:^|\*)7$/.test(userdata);
+
+    if (isSvShortcode) {
+      // Mark session so all follow-up inputs are forwarded too.
+      await setSession(sessionid, { stage: 'SV_PROXY' });
+      // Forward the START to SV with empty userdata (the "7" was just routing).
+      const svReply = await proxyToSv({
+        network, sessionid, mode: 'START', msisdn,
+        userdata: '', username, trafficid, other,
+      });
+      if (svReply) {
+        // If SV already closed the session (unlikely on START but be safe), clean up.
+        if (svReply.split('|')[1] === 'END') await clearSession(sessionid);
+        res.setHeader('Content-Type', 'text/plain');
+        return res.status(200).send(svReply);
+      }
+      return endSession('DataBundles service is unavailable. Please try again.');
+    }
+
+    if (!isNewSession && existingSession?.stage === 'SV_PROXY') {
+      // ── END notification — forward to SV then clean up ──────────────────
+      if (mode === 'END') {
+        await proxyToSv({ network, sessionid, mode: 'END', msisdn, userdata, username, trafficid, other });
+        await clearSession(sessionid);
+        res.setHeader('Content-Type', 'text/plain');
+        return res.status(200).send('');
+      }
+
+      // ── Regular input — forward to SV ────────────────────────────────────
+      const svReply = await proxyToSv({ network, sessionid, mode, msisdn, userdata, username, trafficid, other });
+      if (svReply) {
+        // SV returned mode=END → clean up proxy session record.
+        if (svReply.split('|')[1] === 'END') await clearSession(sessionid);
+        res.setHeader('Content-Type', 'text/plain');
+        return res.status(200).send(svReply);
+      }
+      return endSession('DataBundles service is unavailable. Please try again.');
+    }
+
+    // ── New session → show main menu ─────────────────────────────────────────
+    if (isNewSession || existingSession === null) {
+      await setSession(sessionid, { stage: 'MENU' });
+      return sendText(
         `Welcome to WAEC GH Checkers\n` +
         `1. WASSCE (GHS ${prices.WASSCE})\n` +
         `2. BECE (GHS ${prices.BECE})\n` +
@@ -479,62 +434,73 @@ export default async function handler(req, res) {
       );
     }
 
+    // ── END mode — customer closed the session on their handset ──────────────
+    if (mode === 'END') {
+      await clearSession(sessionid);
+      // No response needed for END; Wigal just notifies us the session closed
+      res.setHeader('Content-Type', 'text/plain');
+      return res.status(200).send('');
+    }
+
     const session = existingSession;
-    const choice  = userInput;
+    const choice  = userdata; // digit(s) the customer typed
 
     console.log(`[USSD] stage="${session.stage}" choice="${choice}"`);
 
     switch (session.stage) {
 
+      // ── Main menu ──────────────────────────────────────────────────────────
       case 'MENU': {
         const typeMap = { '1': 'WASSCE', '2': 'BECE' };
-        if (choice === '0') return respond('Thank you. Goodbye!', false);
+        if (choice === '0') return endSession('Thank you. Goodbye!');
         if (!typeMap[choice]) {
-          return respond(
+          return sendText(
             `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n0. Exit`,
             true
           );
         }
         const voucherType = typeMap[choice];
-        await setSession(sessionId, { stage: 'SELECT_QTY', voucherType });
-        return respond(
+        await setSession(sessionid, { stage: 'SELECT_QTY', voucherType });
+        return sendText(
           `${voucherType} @ GHS ${prices[voucherType]} each.\nHow many? (1-5)`,
           true
         );
       }
 
+      // ── Quantity selection ─────────────────────────────────────────────────
       case 'SELECT_QTY': {
         const qty = parseInt(choice, 10);
         if (!qty || qty < 1 || qty > 5) {
-          return respond('Please enter a number between 1 and 5:', true);
+          return sendText('Please enter a number between 1 and 5:', true);
         }
         const unitPrice = parseFloat(prices[String(session.voucherType)] || 0);
-        const total = (unitPrice * qty).toFixed(2);
-        await setSession(sessionId, { stage: 'CONFIRM', voucherType: session.voucherType, quantity: qty });
-        return respond(
+        const total     = (unitPrice * qty).toFixed(2);
+        await setSession(sessionid, { stage: 'CONFIRM', voucherType: session.voucherType, quantity: qty });
+        return sendText(
           `${qty}x ${session.voucherType} = GHS ${total}\nMoMo: ${msisdn}\n\n1. Confirm & Pay\n2. Cancel`,
           true
         );
       }
 
+      // ── Order confirmation ─────────────────────────────────────────────────
       case 'CONFIRM': {
-        if (choice === '2') return respond('Cancelled. Goodbye!', false);
-        if (choice !== '1') return respond('Press 1 to confirm or 2 to cancel:', true);
+        if (choice === '2') return endSession('Cancelled. Goodbye!');
+        if (choice !== '1') return sendText('Press 1 to confirm or 2 to cancel:', true);
 
         const voucherType = session.voucherType ? String(session.voucherType) : null;
-        const quantity    = session.quantity ? parseInt(session.quantity, 10) : 0;
+        const quantity    = session.quantity    ? parseInt(session.quantity, 10) : 0;
         const unitPrice   = parseFloat(prices[voucherType] || 0);
         const total       = (unitPrice * quantity).toFixed(2);
 
         if (!voucherType || !quantity) {
           console.error('[USSD] CONFIRM: missing session data', JSON.stringify(session));
-          return respond('Session expired. Please dial again.', false);
+          return endSession('Session expired. Please dial again.');
         }
 
-        const safeSuffix = String(sessionId).replace(/\W/g, '').slice(-6).toUpperCase() || 'USSD';
-        const ref = `USSD-${Date.now()}-${safeSuffix}`;
+        const safeSuffix = String(sessionid).replace(/\W/g, '').slice(-6).toUpperCase() || 'USSD';
+        const ref        = `USSD-${Date.now()}-${safeSuffix}`;
 
-        // Reserve vouchers (or create preorder) before triggering payment
+        // ── Reserve vouchers / create preorder ────────────────────────────
         const client = await pool.connect();
         try {
           await client.query('BEGIN');
@@ -548,8 +514,6 @@ export default async function handler(req, res) {
           );
 
           if (available.rows.length >= quantity) {
-            // Reserve vouchers — mark as sold with this ref
-            // Webhook will send SMS after payment confirmed
             const ids = available.rows.map(v => v.id);
             await client.query(
               `UPDATE vouchers SET status='sold', sold_to=$1, transaction_ref=$2, sold_at=NOW()
@@ -563,7 +527,7 @@ export default async function handler(req, res) {
               [ref, msisdn, parseFloat(total), quantity, voucherType]
             );
           } else {
-            // Out of stock — save preorder, webhook will handle when stock is added
+            // Out of stock — record pre-order; admin will fulfil when stock is uploaded
             await client.query(
               `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
                VALUES ($1,$2,'',$3,$4,$5,'pending',NOW())
@@ -587,66 +551,89 @@ export default async function handler(req, res) {
           await client.query('ROLLBACK');
           client.release();
           console.error('[USSD] CONFIRM DB error:', dbErr.message);
-          return respond('An error occurred. Please try again.', false);
+          return endSession('An error occurred. Please try again.');
         }
 
-        // Map USSD network to Moolre payment channel
-        // USSD: 3=MTN, 5=AT, 6=Telecel → Payment: 13=MTN, 7=AT, 6=Telecel
-        const networkToChannel = { 3: '13', 5: '7', 6: '6' };
-        const channel = networkToChannel[network] || '13';
-
-        // Moolre payment API requires local format: 0XXXXXXXXX
+        // ── Trigger MoMo PIN prompt ────────────────────────────────────────
+        // Phone format for Hubtel: local 0XXXXXXXXX
         const payerLocal = msisdn.startsWith('233')  ? '0' + msisdn.slice(3)  :
                            msisdn.startsWith('+233') ? '0' + msisdn.slice(4)  :
                            msisdn;
 
-        // Trigger MoMo PIN prompt
+        const networkName = networkToHubtelName(network);
+
+        let paymentTriggered = false;
+
+        // Primary — Hubtel direct debit
         try {
-          const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
-            method: 'POST',
-            headers: {
-              'X-API-USER':   process.env.MOOLRE_USERNAME,
-              'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              type:          1,
-              channel,
-              currency:      'GHS',
-              payer:         payerLocal,
-              amount:        parseFloat(total),
-              externalref:   ref,
-              reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
-              sessionid:     sessionId,
-              accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
-            }),
+          await initHubtelDirectDebit({
+            phone:       payerLocal,
+            amount:      parseFloat(total),
+            reference:   ref,
+            description: `${quantity}x ${voucherType} - WAEC GH Checkers`,
+            network:     networkName,
           });
-          const payData = await payRes.json();
-          console.log('[USSD] Moolre payment response:', JSON.stringify(payData));
-        } catch (payErr) {
-          console.error('[USSD] Moolre payment error:', payErr.message);
+          console.log('[USSD] Hubtel direct debit triggered for', ref);
+          paymentTriggered = true;
+        } catch (hubtelErr) {
+          console.error('[USSD] Hubtel direct debit failed, trying Moolre fallback:', hubtelErr.message);
         }
 
-        // Poll for payment status as fallback — Moolre may not fire a webhook
-        // for USSD-triggered payments. Poll every 5s for up to 60s.
+        // Fallback — Moolre direct payment
+        if (!paymentTriggered) {
+          try {
+            const channelMap  = { MTN: '13', AT: '7', TELECEL: '6' };
+            const channel     = channelMap[networkName] || '13';
+            const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
+              method: 'POST',
+              headers: {
+                'X-API-USER':   process.env.MOOLRE_USERNAME,
+                'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                type:          1,
+                channel,
+                currency:      'GHS',
+                payer:         payerLocal,
+                amount:        parseFloat(total),
+                externalref:   ref,
+                reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
+                sessionid:     sessionid,
+                accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+              }),
+            });
+            const payData = await payRes.json();
+            console.log('[USSD] Moolre fallback response:', JSON.stringify(payData));
+          } catch (moolreErr) {
+            console.error('[USSD] Moolre fallback also failed:', moolreErr.message);
+          }
+        }
+
+        // Background poll — safety net if webhook is delayed
         pollAndFulfill({ ref, phone: msisdn, voucherType, quantity, total });
 
-        return respond(
-          `Please authorize the GHS ${total} MoMo payment prompt on your phone.\nVouchers will be sent via SMS after payment.`,
-          false
+        // Close the USSD session — customer now approves on MoMo prompt
+        return endSession(
+          `Please authorize the GHS ${total} MoMo payment on your phone. Your voucher PIN will be sent by SMS once payment is confirmed.`
         );
       }
 
+      // ── Unknown stage — reset ──────────────────────────────────────────────
       default:
-        await setSession(sessionId, { stage: 'MENU' });
-        return respond(
-          `WAEC GH Checkers\n1. WASSCE\n2. BECE\n0. Exit`,
+        await setSession(sessionid, { stage: 'MENU' });
+        return sendText(
+          `WAEC GH Checkers\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n0. Exit`,
           true
         );
     }
 
   } catch (err) {
     console.error('[USSD] Unhandled error:', err.message, err.stack);
-    return res.status(200).json({ message: 'Service error. Please try again.', reply: false });
+    res.setHeader('Content-Type', 'text/plain');
+    return res.status(200).send(
+      buildResponse({ network, mode: 'END', msisdn, sessionid,
+        userdata: 'Service error. Please try again.', username, trafficid, other })
+    );
   }
 }
