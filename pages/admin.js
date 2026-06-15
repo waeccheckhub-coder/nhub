@@ -11,7 +11,7 @@ import {
   Search, RefreshCw, Printer, Download, Menu, X,
   CheckCircle, Clock, AlertCircle, ChevronLeft, ChevronRight,
   Phone, DollarSign, TrendingUp, ShieldCheck, Eye, EyeOff, Send,
-  Check, Edit3, Save, MessageSquare, Users, AlertTriangle,
+  Check, Edit3, Save, MessageSquare, Users, AlertTriangle, Calendar,
 } from 'lucide-react';
 
 const TABS = [
@@ -978,11 +978,50 @@ export default function Admin() {
                     ))}
                   </div>
                 </div>
+
+                {/* Release Date Messages */}
+                <div className="bg-white border border-black/[0.06] rounded-2xl p-5 shadow-sm">
+                  <div className="flex items-center gap-3 mb-5">
+                    <div className="w-10 h-10 bg-blue-100 rounded-xl flex items-center justify-center flex-shrink-0">
+                      <Calendar size={18} className="text-blue-600" />
+                    </div>
+                    <div>
+                      <h3 className="font-black text-sm">Release Date Messages</h3>
+                      <p className="text-xs text-black/40">Shown when customers check via USSD (options 4 & 5)</p>
+                    </div>
+                  </div>
+                  <div className="space-y-4">
+                    {[
+                      { key: 'bece_release_message', label: 'BECE Release Date Message', placeholder: 'BECE 2025 results will be released on 15 Aug 2025. Visit waecgh.org to check.' },
+                      { key: 'wassce_release_message', label: 'WASSCE Release Date Message', placeholder: 'WASSCE 2025 results will be released on 20 Nov 2025. Visit waecgh.org to check.' },
+                    ].map(({ key, label, placeholder }) => (
+                      <div key={key}>
+                        <label className="text-[10px] font-black uppercase tracking-widest text-black/40 block mb-2">{label}</label>
+                        {settingsEditing ? (
+                          <textarea
+                            value={settingsDraft[key] || ''}
+                            onChange={e => setSettingsDraft(d => ({ ...d, [key]: e.target.value }))}
+                            placeholder={placeholder}
+                            rows={3}
+                            maxLength={160}
+                            className="w-full border border-black/10 rounded-xl px-4 py-3 text-sm outline-none focus:border-indigo-400 resize-none"
+                          />
+                        ) : (
+                          <p className="text-sm py-3 px-4 bg-[#fafafa] rounded-xl border border-black/[0.06] min-h-[60px] whitespace-pre-wrap">
+                            {settings[key] || <span className="text-black/30 italic">Not set — default message will be shown</span>}
+                          </p>
+                        )}
+                        <p className="text-[10px] text-black/30 mt-1">Max 160 chars (USSD limit). Sent as the final reply when customer selects this option.</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
               </div>
             </div>
           )}
 
-          {/* ===================== SMS CENTER ===================== */}
+          {/* ===================== SMS CENTER ===================== */}}
           {activeTab === 'sms' && (
             <div className="p-4 md:p-8 max-w-2xl">
               <div className="mb-6">
