@@ -1021,7 +1021,7 @@ export default function Admin() {
             </div>
           )}
 
-          {/* ===================== SMS CENTER ===================== */}}
+          {/* ===================== SMS CENTER ===================== */}
           {activeTab === 'sms' && (
             <div className="p-4 md:p-8 max-w-2xl">
               <div className="mb-6">
