@@ -14,7 +14,7 @@
 // RESPONSE: { message: string, reply: boolean }
 
 import pool from '../../lib/db';
-import { getPrices } from '../../lib/settings';
+import { getPrices, getSetting } from '../../lib/settings';
 import { sendAdminAlert } from '../../lib/alerts';
 import { sendVoucherSMS, sendPreorderSMS } from '../../lib/sms';
 
@@ -474,6 +474,9 @@ export default async function handler(req, res) {
         `Welcome to WAEC GH Checkers\n` +
         `1. WASSCE (GHS ${prices.WASSCE})\n` +
         `2. BECE (GHS ${prices.BECE})\n` +
+        `3. Retrieve Voucher\n` +
+        `4. BECE Release Date\n` +
+        `5. WASSCE Release Date\n` +
         `0. Exit`,
         true
       );
@@ -489,9 +492,21 @@ export default async function handler(req, res) {
       case 'MENU': {
         const typeMap = { '1': 'WASSCE', '2': 'BECE' };
         if (choice === '0') return respond('Thank you. Goodbye!', false);
+        if (choice === '3') {
+          await setSession(sessionId, { stage: 'RETRIEVE_PHONE' });
+          return respond('Enter phone number used for purchase\n(or press 0 to go back):', true);
+        }
+        if (choice === '4') {
+          const msg = await getSetting('bece_release_message', 'BECE release date has not been announced yet. Check back soon.');
+          return respond(msg, false);
+        }
+        if (choice === '5') {
+          const msg = await getSetting('wassce_release_message', 'WASSCE release date has not been announced yet. Check back soon.');
+          return respond(msg, false);
+        }
         if (!typeMap[choice]) {
           return respond(
-            `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n0. Exit`,
+            `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. Retrieve Voucher\n4. BECE Release Date\n5. WASSCE Release Date\n0. Exit`,
             true
           );
         }
@@ -637,10 +652,42 @@ export default async function handler(req, res) {
         );
       }
 
+      // ── Retrieve voucher — phone entry ────────────────────────────────────
+      case 'RETRIEVE_PHONE': {
+        if (choice === '0') {
+          await setSession(sessionId, { stage: 'MENU' });
+          return respond(
+            `WAEC GH Checkers\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. Retrieve Voucher\n4. BECE Release Date\n5. WASSCE Release Date\n0. Exit`,
+            true
+          );
+        }
+        // Normalise the phone number to 233XXXXXXXXX
+        let lookupPhone = choice.replace(/\s/g, '');
+        if (lookupPhone.startsWith('+')) lookupPhone = lookupPhone.slice(1);
+        if (lookupPhone.startsWith('0')) lookupPhone = '233' + lookupPhone.slice(1);
+
+        try {
+          const result = await pool.query(
+            `SELECT serial, pin, type FROM vouchers
+             WHERE sold_to = $1 AND status = 'sold'
+             ORDER BY sold_at DESC LIMIT 5`,
+            [lookupPhone]
+          );
+          if (result.rowCount === 0) {
+            return respond('No vouchers found for that number. Please check the number and try again.', false);
+          }
+          const lines = result.rows.map(v => `${v.type}: SN ${v.serial} PIN ${v.pin}`);
+          return respond(`Your vouchers:\n${lines.join('\n')}`, false);
+        } catch (dbErr) {
+          console.error('[USSD] RETRIEVE_PHONE DB error:', dbErr.message);
+          return respond('Error looking up vouchers. Please try again.', false);
+        }
+      }
+
       default:
         await setSession(sessionId, { stage: 'MENU' });
         return respond(
-          `WAEC GH Checkers\n1. WASSCE\n2. BECE\n0. Exit`,
+          `WAEC GH Checkers\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. Retrieve Voucher\n4. BECE Release Date\n5. WASSCE Release Date\n0. Exit`,
           true
         );
     }
