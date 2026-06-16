@@ -258,10 +258,23 @@ async function pollAndFulfill({ ref, phone, voucherType, quantity, total }) {
         );
 
         if (vouchers.rowCount < quantity) {
+          // Payment confirmed but no stock — save preorder so admin can fulfill it
+          await client.query(
+            `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
+             VALUES ($1,$2,'',$3,$4,$5,'pending',NOW())
+             ON CONFLICT (reference) DO NOTHING`,
+            [ref, phone, parseFloat(total), quantity, voucherType]
+          );
+          await client.query(
+            `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
+             VALUES ($1,$2,$3,$4,$5,'preorder',NOW())
+             ON CONFLICT (reference) DO UPDATE SET status='preorder'`,
+            [ref, phone, parseFloat(total), quantity, voucherType]
+          );
           await client.query('COMMIT');
           client.release();
           await sendPreorderSMS(phone, voucherType, ref);
-          await sendAdminAlert(`OUT OF STOCK (poll): ${voucherType} x${quantity} from ${phone}. Ref: ${ref}`);
+          await sendAdminAlert(`⚠️ USSD Preorder: ${voucherType} x${quantity} from ${phone}. Ref: ${ref}`);
           return;
         }
 
@@ -515,59 +528,10 @@ export default async function handler(req, res) {
         const safeSuffix = String(sessionid).replace(/\W/g, '').slice(-6).toUpperCase() || 'USSD';
         const ref        = `USSD-${Date.now()}-${safeSuffix}`;
 
-        // ── Reserve vouchers / create preorder ────────────────────────────
-        const client = await pool.connect();
-        try {
-          await client.query('BEGIN');
-
-          const available = await client.query(
-            `SELECT id, serial, pin FROM vouchers
-             WHERE type=$1 AND status='available'
-             ORDER BY id ASC LIMIT $2
-             FOR UPDATE SKIP LOCKED`,
-            [voucherType, quantity]
-          );
-
-          if (available.rows.length >= quantity) {
-            const ids = available.rows.map(v => v.id);
-            await client.query(
-              `UPDATE vouchers SET status='sold', sold_to=$1, transaction_ref=$2, sold_at=NOW()
-               WHERE id=ANY($3)`,
-              [msisdn, ref, ids]
-            );
-            await client.query(
-              `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-               VALUES ($1,$2,$3,$4,$5,'pending',NOW())
-               ON CONFLICT (reference) DO NOTHING`,
-              [ref, msisdn, parseFloat(total), quantity, voucherType]
-            );
-          } else {
-            // Out of stock — record pre-order; admin will fulfil when stock is uploaded
-            await client.query(
-              `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
-               VALUES ($1,$2,'',$3,$4,$5,'pending',NOW())
-               ON CONFLICT (reference) DO NOTHING`,
-              [ref, msisdn, parseFloat(total), quantity, voucherType]
-            );
-            await client.query(
-              `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-               VALUES ($1,$2,$3,$4,$5,'preorder',NOW())
-               ON CONFLICT (reference) DO NOTHING`,
-              [ref, msisdn, parseFloat(total), quantity, voucherType]
-            );
-            await sendAdminAlert(
-              `⚠️ USSD Preorder: ${voucherType} x${quantity} GHS ${total} from ${msisdn}. Ref: ${ref}`
-            );
-          }
-
-          await client.query('COMMIT');
-          client.release();
-        } catch (dbErr) {
-          await client.query('ROLLBACK');
-          client.release();
-          console.error('[USSD] CONFIRM DB error:', dbErr.message);
-          return endSession('An error occurred. Please try again.');
-        }
+        // ── Do NOT reserve vouchers or create a preorder here ─────────────
+        // Payment has not happened yet — the customer still needs to approve
+        // the MoMo prompt. Vouchers are assigned (or a preorder created) only
+        // after payment is confirmed inside pollAndFulfill / hubtel-webhook.
 
         // ── Trigger MoMo PIN prompt ────────────────────────────────────────
         // Phone format for Hubtel: local 0XXXXXXXXX
