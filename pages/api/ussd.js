@@ -563,6 +563,11 @@ export default async function handler(req, res) {
           try {
             const channelMap  = { MTN: '13', AT: '7', TELECEL: '6' };
             const channel     = channelMap[networkName] || '13';
+            console.log('[USSD] Moolre fallback request:', JSON.stringify({
+              channel, currency: 'GHS', payer: payerLocal.slice(0, -4) + '****',
+              amount: total, externalref: ref, accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+              hasApiKey: !!process.env.MOOLRE_API_KEY,
+            }));
             const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
               method: 'POST',
               headers: {
@@ -578,7 +583,7 @@ export default async function handler(req, res) {
                 channel,
                 currency:      'GHS',
                 payer:         payerLocal,
-                amount:        parseFloat(total),
+                amount:        total, // Moolre docs: amount must be a string, e.g. "30.00"
                 externalref:   ref,
                 reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
                 sessionid:     sessionid,
