@@ -578,12 +578,17 @@ export default async function handler(req, res) {
                            msisdn;
 
         // Trigger MoMo PIN prompt
+        let paymentTriggered = false;
         try {
           const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
             method: 'POST',
             headers: {
+              // NOTE: the Initiate Payment endpoint requires the PRIVATE key
+              // (X-API-KEY), not the public key. Using X-API-PUBKEY here makes
+              // Moolre reject the request, so the MoMo prompt never goes out —
+              // this was the bug causing "no prompt" on USSD.
               'X-API-USER':   process.env.MOOLRE_USERNAME,
-              'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
+              'X-API-KEY':    process.env.MOOLRE_API_KEY,
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({
@@ -600,8 +605,19 @@ export default async function handler(req, res) {
           });
           const payData = await payRes.json();
           console.log('[USSD] Moolre payment response:', JSON.stringify(payData));
+          // status === 1 means Moolre accepted the request and sent the
+          // prompt. Anything else (e.g. auth failure) means nothing was sent.
+          paymentTriggered = Number(payData?.status) === 1;
+          if (!paymentTriggered) {
+            console.error(`[USSD] Moolre payment NOT accepted for ${ref}: status=${payData?.status} code=${payData?.code} message="${payData?.message}"`);
+          }
         } catch (payErr) {
           console.error('[USSD] Moolre payment error:', payErr.message);
+        }
+
+        if (!paymentTriggered) {
+          await sendAdminAlert(`⚠️ USSD payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Customer saw an error.`);
+          return respond('Unable to start payment right now. Please try again shortly.', false);
         }
 
         // Poll for payment status as fallback — Moolre may not fire a webhook
