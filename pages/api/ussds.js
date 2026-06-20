@@ -579,6 +579,11 @@ export default async function handler(req, res) {
 
         // Trigger MoMo PIN prompt
         let paymentTriggered = false;
+        console.log('[USSD] Moolre payment request:', JSON.stringify({
+          channel, currency: 'GHS', payer: payerLocal.slice(0, -4) + '****',
+          amount: total, externalref: ref, accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+          hasApiKey: !!process.env.MOOLRE_API_KEY,
+        }));
         try {
           const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
             method: 'POST',
@@ -596,7 +601,7 @@ export default async function handler(req, res) {
               channel,
               currency:      'GHS',
               payer:         payerLocal,
-              amount:        parseFloat(total),
+              amount:        total, // Moolre docs: amount must be a string, e.g. "30.00"
               externalref:   ref,
               reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
               sessionid:     sessionId,
