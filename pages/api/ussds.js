@@ -14,7 +14,7 @@
 // RESPONSE: { message: string, reply: boolean }
 
 import pool from '../../lib/db';
-import { getPrices } from '../../lib/settings';
+import { getPrices, getSetting } from '../../lib/settings';
 import { sendAdminAlert } from '../../lib/alerts';
 import { sendVoucherSMS, sendPreorderSMS } from '../../lib/sms';
 
@@ -363,10 +363,23 @@ async function pollAndFulfill({ ref, phone, voucherType, quantity, total }) {
         );
 
         if (vouchers.rowCount < quantity) {
+          // Payment confirmed but no stock — save preorder so admin can fulfill it
+          await client.query(
+            `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
+             VALUES ($1,$2,'',$3,$4,$5,'pending',NOW())
+             ON CONFLICT (reference) DO NOTHING`,
+            [ref, phone, parseFloat(total), quantity, voucherType]
+          );
+          await client.query(
+            `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
+             VALUES ($1,$2,$3,$4,$5,'preorder',NOW())
+             ON CONFLICT (reference) DO UPDATE SET status='preorder'`,
+            [ref, phone, parseFloat(total), quantity, voucherType]
+          );
           await client.query('COMMIT');
           client.release();
           await sendPreorderSMS(phone, voucherType, ref);
-          await sendAdminAlert(`OUT OF STOCK (poll): ${voucherType} x${quantity} from ${phone}. Ref: ${ref}`);
+          await sendAdminAlert(`⚠️ USSD Preorder: ${voucherType} x${quantity} from ${phone}. Ref: ${ref}`);
           return;
         }
 
@@ -474,6 +487,9 @@ export default async function handler(req, res) {
         `Welcome to WAEC GH Checkers\n` +
         `1. WASSCE (GHS ${prices.WASSCE})\n` +
         `2. BECE (GHS ${prices.BECE})\n` +
+        `3. Retrieve Voucher\n` +
+        `4. BECE Release Date\n` +
+        `5. WASSCE Release Date\n` +
         `0. Exit`,
         true
       );
@@ -489,9 +505,21 @@ export default async function handler(req, res) {
       case 'MENU': {
         const typeMap = { '1': 'WASSCE', '2': 'BECE' };
         if (choice === '0') return respond('Thank you. Goodbye!', false);
+        if (choice === '3') {
+          await setSession(sessionId, { stage: 'RETRIEVE_PHONE' });
+          return respond('Enter phone number used for purchase\n(or press 0 to go back):', true);
+        }
+        if (choice === '4') {
+          const msg = await getSetting('bece_release_message', 'BECE release date has not been announced yet. Check back soon.');
+          return respond(msg, false);
+        }
+        if (choice === '5') {
+          const msg = await getSetting('wassce_release_message', 'WASSCE release date has not been announced yet. Check back soon.');
+          return respond(msg, false);
+        }
         if (!typeMap[choice]) {
           return respond(
-            `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n0. Exit`,
+            `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. Retrieve Voucher\n4. BECE Release Date\n5. WASSCE Release Date\n0. Exit`,
             true
           );
         }
@@ -534,61 +562,10 @@ export default async function handler(req, res) {
         const safeSuffix = String(sessionId).replace(/\W/g, '').slice(-6).toUpperCase() || 'USSD';
         const ref = `USSD-${Date.now()}-${safeSuffix}`;
 
-        // Reserve vouchers (or create preorder) before triggering payment
-        const client = await pool.connect();
-        try {
-          await client.query('BEGIN');
-
-          const available = await client.query(
-            `SELECT id, serial, pin FROM vouchers
-             WHERE type=$1 AND status='available'
-             ORDER BY id ASC LIMIT $2
-             FOR UPDATE SKIP LOCKED`,
-            [voucherType, quantity]
-          );
-
-          if (available.rows.length >= quantity) {
-            // Reserve vouchers — mark as sold with this ref
-            // Webhook will send SMS after payment confirmed
-            const ids = available.rows.map(v => v.id);
-            await client.query(
-              `UPDATE vouchers SET status='sold', sold_to=$1, transaction_ref=$2, sold_at=NOW()
-               WHERE id=ANY($3)`,
-              [msisdn, ref, ids]
-            );
-            await client.query(
-              `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-               VALUES ($1,$2,$3,$4,$5,'pending',NOW())
-               ON CONFLICT (reference) DO NOTHING`,
-              [ref, msisdn, parseFloat(total), quantity, voucherType]
-            );
-          } else {
-            // Out of stock — save preorder, webhook will handle when stock is added
-            await client.query(
-              `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
-               VALUES ($1,$2,'',$3,$4,$5,'pending',NOW())
-               ON CONFLICT (reference) DO NOTHING`,
-              [ref, msisdn, parseFloat(total), quantity, voucherType]
-            );
-            await client.query(
-              `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-               VALUES ($1,$2,$3,$4,$5,'preorder',NOW())
-               ON CONFLICT (reference) DO NOTHING`,
-              [ref, msisdn, parseFloat(total), quantity, voucherType]
-            );
-            await sendAdminAlert(
-              `⚠️ USSD Preorder: ${voucherType} x${quantity} GHS ${total} from ${msisdn}. Ref: ${ref}`
-            );
-          }
-
-          await client.query('COMMIT');
-          client.release();
-        } catch (dbErr) {
-          await client.query('ROLLBACK');
-          client.release();
-          console.error('[USSD] CONFIRM DB error:', dbErr.message);
-          return respond('An error occurred. Please try again.', false);
-        }
+        // ── Do NOT reserve vouchers or create a preorder here ─────────────
+        // Payment has not happened yet — the customer still needs to approve
+        // the MoMo prompt. Vouchers are assigned (or a preorder created) only
+        // after payment is confirmed inside pollAndFulfill / handlePaymentWebhook.
 
         // Map USSD network to Moolre payment channel
         // USSD: 3=MTN, 5=AT, 6=Telecel → Payment: 13=MTN, 7=AT, 6=Telecel
@@ -601,12 +578,22 @@ export default async function handler(req, res) {
                            msisdn;
 
         // Trigger MoMo PIN prompt
+        let paymentTriggered = false;
+        console.log('[USSD] Moolre payment request:', JSON.stringify({
+          channel, currency: 'GHS', payer: payerLocal.slice(0, -4) + '****',
+          amount: total, externalref: ref, accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+          hasApiKey: !!process.env.MOOLRE_API_KEY,
+        }));
         try {
           const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
             method: 'POST',
             headers: {
+              // NOTE: the Initiate Payment endpoint requires the PRIVATE key
+              // (X-API-KEY), not the public key. Using X-API-PUBKEY here makes
+              // Moolre reject the request, so the MoMo prompt never goes out —
+              // this was the bug causing "no prompt" on USSD.
               'X-API-USER':   process.env.MOOLRE_USERNAME,
-              'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
+              'X-API-KEY':    process.env.MOOLRE_API_KEY,
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({
@@ -614,7 +601,7 @@ export default async function handler(req, res) {
               channel,
               currency:      'GHS',
               payer:         payerLocal,
-              amount:        parseFloat(total),
+              amount:        total, // Moolre docs: amount must be a string, e.g. "30.00"
               externalref:   ref,
               reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
               sessionid:     sessionId,
@@ -623,8 +610,19 @@ export default async function handler(req, res) {
           });
           const payData = await payRes.json();
           console.log('[USSD] Moolre payment response:', JSON.stringify(payData));
+          // status === 1 means Moolre accepted the request and sent the
+          // prompt. Anything else (e.g. auth failure) means nothing was sent.
+          paymentTriggered = Number(payData?.status) === 1;
+          if (!paymentTriggered) {
+            console.error(`[USSD] Moolre payment NOT accepted for ${ref}: status=${payData?.status} code=${payData?.code} message="${payData?.message}"`);
+          }
         } catch (payErr) {
           console.error('[USSD] Moolre payment error:', payErr.message);
+        }
+
+        if (!paymentTriggered) {
+          await sendAdminAlert(`⚠️ USSD payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Customer saw an error.`);
+          return respond('Unable to start payment right now. Please try again shortly.', false);
         }
 
         // Poll for payment status as fallback — Moolre may not fire a webhook
@@ -637,10 +635,42 @@ export default async function handler(req, res) {
         );
       }
 
+      // ── Retrieve voucher — phone entry ────────────────────────────────────
+      case 'RETRIEVE_PHONE': {
+        if (choice === '0') {
+          await setSession(sessionId, { stage: 'MENU' });
+          return respond(
+            `WAEC GH Checkers\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. Retrieve Voucher\n4. BECE Release Date\n5. WASSCE Release Date\n0. Exit`,
+            true
+          );
+        }
+        // Normalise the phone number to 233XXXXXXXXX
+        let lookupPhone = choice.replace(/\s/g, '');
+        if (lookupPhone.startsWith('+')) lookupPhone = lookupPhone.slice(1);
+        if (lookupPhone.startsWith('0')) lookupPhone = '233' + lookupPhone.slice(1);
+
+        try {
+          const result = await pool.query(
+            `SELECT serial, pin, type FROM vouchers
+             WHERE sold_to = $1 AND status = 'sold'
+             ORDER BY sold_at DESC LIMIT 5`,
+            [lookupPhone]
+          );
+          if (result.rowCount === 0) {
+            return respond('No vouchers found for that number. Please check the number and try again.', false);
+          }
+          const lines = result.rows.map(v => `${v.type}: SN ${v.serial} PIN ${v.pin}`);
+          return respond(`Your vouchers:\n${lines.join('\n')}`, false);
+        } catch (dbErr) {
+          console.error('[USSD] RETRIEVE_PHONE DB error:', dbErr.message);
+          return respond('Error looking up vouchers. Please try again.', false);
+        }
+      }
+
       default:
         await setSession(sessionId, { stage: 'MENU' });
         return respond(
-          `WAEC GH Checkers\n1. WASSCE\n2. BECE\n0. Exit`,
+          `WAEC GH Checkers\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. Retrieve Voucher\n4. BECE Release Date\n5. WASSCE Release Date\n0. Exit`,
           true
         );
     }
