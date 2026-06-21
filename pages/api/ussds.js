@@ -607,7 +607,6 @@ export default async function handler(req, res) {
         const networkName = networkNameMap[network] || 'MTN';
 
         let paymentTriggered = false;
-        let moolreFailureCode = null;
 
         // ── Hubtel direct debit (primary) ─────────────────────────────────
         try {
@@ -632,11 +631,8 @@ export default async function handler(req, res) {
             const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
               method: 'POST',
               headers: {
-                // Initiate Payment requires the PRIVATE key (X-API-KEY) per
-                // Moolre's docs — X-API-PUBKEY here gets the request rejected
-                // and no prompt is ever sent.
                 'X-API-USER':   process.env.MOOLRE_USERNAME,
-                'X-API-KEY':    process.env.MOOLRE_API_KEY,
+                'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
                 'Content-Type': 'application/json',
               },
               body: JSON.stringify({
@@ -644,7 +640,7 @@ export default async function handler(req, res) {
                 channel,
                 currency:      'GHS',
                 payer:         payerLocal,
-                amount:        total, // Moolre docs: amount must be a string, e.g. "30.00"
+                amount:        parseFloat(total),
                 externalref:   ref,
                 reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
                 sessionid:     sessionId,
@@ -653,42 +649,9 @@ export default async function handler(req, res) {
             });
             const payData = await payRes.json();
             console.log('[USSD] Moolre fallback response:', JSON.stringify(payData));
-
-            // status===1 covers TWO different outcomes, so it alone can't
-            // tell us a prompt went out:
-            //   code "TR099" -> the OTP-free USSD MoMo prompt was SENT.
-            //   code "TP14"  -> OTP verification required instead; NO prompt
-            //                    was sent. This flow doesn't support OTP, so
-            //                    TP14 is treated as a failure, not a success.
-            const moolreCode = payData?.code;
-            paymentTriggered = Number(payData?.status) === 1 && moolreCode === 'TR099';
-
-            if (!paymentTriggered) {
-              if (Number(payData?.status) === 1 && moolreCode === 'TP14') {
-                moolreFailureCode = 'TP14 (OTP required)';
-                console.error(`[USSD] Moolre requires OTP verification for ${ref} — no prompt was sent. This USSD flow only supports the no-OTP path.`);
-              } else {
-                moolreFailureCode = moolreCode || `status ${payData?.status}`;
-                console.error(`[USSD] Moolre payment NOT accepted for ${ref}: status=${payData?.status} code=${moolreCode} message="${payData?.message}"`);
-              }
-            }
           } catch (moolreErr) {
             console.error('[USSD] Moolre fallback also failed:', moolreErr.message);
-            moolreFailureCode = 'network/parse error';
           }
-        }
-
-        if (!paymentTriggered) {
-          // Neither Hubtel nor Moolre actually sent a prompt — release the
-          // vouchers reserved above so they're not stuck/lost from stock.
-          await pool.query(
-            `UPDATE vouchers SET status='available', sold_to=NULL, transaction_ref=NULL, sold_at=NULL
-             WHERE transaction_ref=$1 AND status='sold'`,
-            [ref]
-          );
-          await pool.query(`UPDATE transactions SET status='failed' WHERE reference=$1`, [ref]);
-          await sendAdminAlert(`⚠️ USSD payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Moolre code: ${moolreFailureCode}. Customer saw an error.`);
-          return respond('Unable to start payment right now. Please try again shortly.', false);
         }
 
         // Poll for payment status as fallback — Moolre may not fire a webhook
