@@ -76,31 +76,29 @@ async function initiatePayment({ payer, networkCode, amount, externalRef, ussdSe
     payer: payerFormatted.slice(0, -4) + '****',
   }));
 
-  const { data } = await publicClient.post('/open/transact/payment', payload);
+  // IMPORTANT: Initiate Payment requires the PRIVATE key under X-API-KEY,
+  // not the public key under X-API-PUBKEY. See:
+  // https://docs.moolre.com/ai/initiate-payment.html
+  // Using publicClient here was rejected by Moolre before any USSD prompt
+  // was sent — this was the root cause of missing payment prompts.
+  const { data } = await privateClient.post('/open/transact/payment', payload);
 
   // ── Full response log — this is the most important thing to check ──────────
   console.log('[Moolre] ← initiatePayment response:', JSON.stringify(data));
 
-  // Moolre success indicators:
-  //   status === 1  → request accepted, prompt sent (most common)
-  //   status === 0  → some Moolre accounts use 0 for "submitted/pending"
-  //   code === "P01" or similar → also indicates success on some accounts
-  //
-  // We treat as OK if status is 1 OR if the message contains a success indicator.
-  // The FULL response is logged above so you can verify exactly what Moolre sends.
-  const statusCode = data?.status ?? data?.code ?? -1;
+  // Per Moolre docs (https://docs.moolre.com/ai/initiate-payment.html),
+  // a prompt was actually sent to the customer's phone only when:
+  //   status === 1 AND code is "TR099" (prompt sent) or "TP14" (OTP required,
+  //   prompt also sent — customer must verify via SMS first)
+  // Any other status/code (e.g. AIN01 auth error, TP13 duplicate ref) means
+  // NO prompt reached the customer. Guessing "ok" from message text alone
+  // (e.g. matching "pending"/"processing") risks masking real auth/validation
+  // failures as success, which is what let this fail silently before.
+  const statusCode = data?.status;
   const numStatus  = typeof statusCode === 'string' ? parseInt(statusCode, 10) : statusCode;
-  const msgLower   = (data?.message || '').toLowerCase();
+  const code       = data?.code || '';
 
-  const ok = (
-    numStatus === 1 ||
-    numStatus === 0 ||                          // some Moolre accounts return 0 for pending
-    msgLower.includes('success') ||
-    msgLower.includes('pending') ||
-    msgLower.includes('submitted') ||
-    msgLower.includes('processing') ||
-    msgLower.includes('initiated')
-  );
+  const ok = numStatus === 1 && (code === 'TR099' || code === 'TP14');
 
   if (!ok) {
     console.warn(`[Moolre] ⚠️  Payment NOT accepted for ${externalRef}:`);

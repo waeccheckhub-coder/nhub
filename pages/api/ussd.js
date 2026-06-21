@@ -559,6 +559,7 @@ export default async function handler(req, res) {
         }
 
         // Fallback — Moolre direct payment
+        let moolreFailed = false;
         if (!paymentTriggered) {
           try {
             const channelMap  = { MTN: '13', AT: '7', TELECEL: '6' };
@@ -566,8 +567,14 @@ export default async function handler(req, res) {
             const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
               method: 'POST',
               headers: {
-                'X-API-USER':   process.env.MOOLRE_USERNAME,
-                'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
+                // Initiate Payment requires the PRIVATE key under X-API-KEY,
+                // not the public key under X-API-PUBKEY (see Moolre docs:
+                // https://docs.moolre.com/ai/initiate-payment.html). Using
+                // X-API-PUBKEY here caused Moolre to reject the request before
+                // the USSD prompt was ever sent — this was the root cause of
+                // the missing payment prompt.
+                'X-API-USER': process.env.MOOLRE_USERNAME,
+                'X-API-KEY':  process.env.MOOLRE_API_KEY,
                 'Content-Type': 'application/json',
               },
               body: JSON.stringify({
@@ -584,9 +591,35 @@ export default async function handler(req, res) {
             });
             const payData = await payRes.json();
             console.log('[USSD] Moolre fallback response:', JSON.stringify(payData));
+
+            // status === 1 with code TR099 (or TP14 for OTP) means the prompt
+            // was actually sent. Anything else (e.g. AIN01 auth error, TP13
+            // duplicate ref) means NO prompt reached the customer's phone.
+            const numStatus = typeof payData?.status === 'string'
+              ? parseInt(payData.status, 10)
+              : payData?.status;
+            if (!payRes.ok || numStatus !== 1) {
+              moolreFailed = true;
+              console.error(
+                `[USSD] Moolre payment NOT accepted for ${ref} — ` +
+                `httpStatus=${payRes.status} status=${numStatus} ` +
+                `code=${payData?.code} message=${payData?.message}`
+              );
+            }
           } catch (moolreErr) {
+            moolreFailed = true;
             console.error('[USSD] Moolre fallback also failed:', moolreErr.message);
           }
+        }
+
+        // Both Hubtel and Moolre failed to trigger a prompt — tell the
+        // customer instead of ending the session as if it worked. Sending
+        // them away under a false "check your phone" message is exactly
+        // what was costing conversions to other vendors.
+        if (!paymentTriggered && moolreFailed) {
+          return endSession(
+            'Sorry, we could not start your payment right now. Please try again shortly or contact support.'
+          );
         }
 
         // Background poll — safety net if webhook is delayed
