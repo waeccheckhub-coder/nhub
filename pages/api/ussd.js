@@ -563,19 +563,11 @@ export default async function handler(req, res) {
           try {
             const channelMap  = { MTN: '13', AT: '7', TELECEL: '6' };
             const channel     = channelMap[networkName] || '13';
-            console.log('[USSD] Moolre fallback request:', JSON.stringify({
-              channel, currency: 'GHS', payer: payerLocal.slice(0, -4) + '****',
-              amount: total, externalref: ref, accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
-              hasApiKey: !!process.env.MOOLRE_API_KEY,
-            }));
             const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
               method: 'POST',
               headers: {
-                // NOTE: the Initiate Payment endpoint requires the PRIVATE key
-                // (X-API-KEY), not the public key. Using X-API-PUBKEY here makes
-                // Moolre reject the request, so the MoMo prompt never goes out.
                 'X-API-USER':   process.env.MOOLRE_USERNAME,
-                'X-API-KEY':    process.env.MOOLRE_API_KEY,
+                'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
                 'Content-Type': 'application/json',
               },
               body: JSON.stringify({
@@ -583,7 +575,7 @@ export default async function handler(req, res) {
                 channel,
                 currency:      'GHS',
                 payer:         payerLocal,
-                amount:        total, // Moolre docs: amount must be a string, e.g. "30.00"
+                amount:        parseFloat(total),
                 externalref:   ref,
                 reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
                 sessionid:     sessionid,
@@ -592,21 +584,9 @@ export default async function handler(req, res) {
             });
             const payData = await payRes.json();
             console.log('[USSD] Moolre fallback response:', JSON.stringify(payData));
-            // status === 1 means Moolre accepted the request and sent the
-            // prompt. Anything else means it failed — don't tell the customer
-            // to check their phone if nothing was actually sent.
-            paymentTriggered = Number(payData?.status) === 1;
-            if (!paymentTriggered) {
-              console.error(`[USSD] Moolre payment NOT accepted for ${ref}: status=${payData?.status} code=${payData?.code} message="${payData?.message}"`);
-            }
           } catch (moolreErr) {
             console.error('[USSD] Moolre fallback also failed:', moolreErr.message);
           }
-        }
-
-        if (!paymentTriggered) {
-          await sendAdminAlert(`⚠️ USSD payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Customer saw an error.`);
-          return endSession('Unable to start payment right now. Please try again shortly.');
         }
 
         // Background poll — safety net if webhook is delayed
