@@ -54,13 +54,19 @@ async function ensureTable() {
       updated_at   TIMESTAMP DEFAULT NOW()
     )
   `);
+  // pending_ref carries the externalref of a payment awaiting OTP (TP14)
+  // so the OTP can be resubmitted against the SAME reference, per Moolre's
+  // documented retry contract (otpcode param on /open/transact/payment).
+  await pool.query(`
+    ALTER TABLE ussd_sessions ADD COLUMN IF NOT EXISTS pending_ref VARCHAR(100)
+  `);
 }
 
 async function getSession(sessionId) {
   try {
     await ensureTable();
     const r = await pool.query(
-      'SELECT stage, voucher_type, quantity FROM ussd_sessions WHERE session_id = $1',
+      'SELECT stage, voucher_type, quantity, pending_ref FROM ussd_sessions WHERE session_id = $1',
       [String(sessionId)]
     );
     if (r.rows.length === 0) return null;
@@ -69,6 +75,7 @@ async function getSession(sessionId) {
       stage:       row.stage || 'MENU',
       voucherType: row.voucher_type || null,
       quantity:    row.quantity != null ? parseInt(row.quantity, 10) : null,
+      pendingRef:  row.pending_ref || null,
     };
   } catch (err) {
     console.error('[USSD] getSession error:', err.message);
@@ -80,15 +87,16 @@ async function setSession(sessionId, data) {
   try {
     await ensureTable();
     await pool.query(
-      `INSERT INTO ussd_sessions (session_id, stage, voucher_type, quantity, updated_at)
-       VALUES ($1, $2, $3, $4, NOW())
+      `INSERT INTO ussd_sessions (session_id, stage, voucher_type, quantity, pending_ref, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
        ON CONFLICT (session_id) DO UPDATE
-       SET stage=$2, voucher_type=$3, quantity=$4, updated_at=NOW()`,
+       SET stage=$2, voucher_type=$3, quantity=$4, pending_ref=$5, updated_at=NOW()`,
       [
         String(sessionId),
         String(data.stage),
         data.voucherType != null ? String(data.voucherType) : null,
         data.quantity    != null ? parseInt(data.quantity, 10) : null,
+        data.pendingRef  != null ? String(data.pendingRef)   : null,
       ]
     );
   } catch (err) {
@@ -415,6 +423,77 @@ async function pollAndFulfill({ ref, phone, voucherType, quantity, total }) {
   console.warn('[USSD] Poll timed out for', ref);
 }
 
+// ── Trigger / resubmit a Moolre USSD payment ──────────────────────────────────
+// Shared by the initial CONFIRM step and the AWAIT_OTP resubmission step.
+// Per https://docs.moolre.com/ai/initiate-payment.html, this endpoint returns
+// status:1 for TWO different outcomes:
+//   code "TR099" -> request accepted, the MoMo prompt was sent directly to
+//                   the customer's phone.
+//   code "TP14"  -> Moolre wants OTP verification first; NO prompt is sent
+//                   on this call. The documented way to complete the payment
+//                   is to resubmit this SAME call with otpcode set, once the
+//                   customer has the code (sent by Moolre via SMS).
+// There is no documented account/request flag that suppresses TP14 outright;
+// only this collect-and-resubmit flow is documented, so that's what we
+// implement. otpcode is omitted entirely on the first attempt (Moolre docs
+// list it as optional) and only included on resubmission.
+async function triggerMoolrePayment({ channel, payerLocal, total, ref, quantity, voucherType, sessionId, otpcode }) {
+  const payload = {
+    type:          1,
+    channel,
+    currency:      'GHS',
+    payer:         payerLocal,
+    amount:        total, // Moolre docs: amount must be a string, e.g. "30.00"
+    externalref:   ref,
+    reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
+    sessionid:     sessionId,
+    accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+  };
+  if (otpcode) payload.otpcode = otpcode;
+
+  console.log('[USSD] Moolre payment request:', JSON.stringify({
+    ...payload,
+    payer: payerLocal.slice(0, -4) + '****',
+    otpcode: otpcode ? '***' : undefined,
+  }));
+
+  let paymentTriggered = false;
+  let otpRequired = false;
+  let payData = null;
+
+  try {
+    const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
+      method: 'POST',
+      headers: {
+        // NOTE: the Initiate Payment endpoint requires the PRIVATE key
+        // (X-API-KEY), not the public key. Using X-API-PUBKEY here makes
+        // Moolre reject the request, so the MoMo prompt never goes out —
+        // this was the bug causing "no prompt" on USSD.
+        'X-API-USER':   process.env.MOOLRE_USERNAME,
+        'X-API-KEY':    process.env.MOOLRE_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    payData = await payRes.json();
+    console.log('[USSD] Moolre payment response:', JSON.stringify(payData));
+
+    const payCode = String(payData?.code || '');
+    otpRequired = payCode === 'TP14';
+    paymentTriggered = Number(payData?.status) === 1 && payCode === 'TR099';
+
+    if (otpRequired) {
+      console.error(`[USSD] Moolre requires OTP verification for ${ref} (otpcode ${otpcode ? 'was' : 'was NOT'} supplied on this attempt).`);
+    } else if (!paymentTriggered) {
+      console.error(`[USSD] Moolre payment NOT accepted for ${ref}: status=${payData?.status} code=${payData?.code} message="${payData?.message}"`);
+    }
+  } catch (payErr) {
+    console.error('[USSD] Moolre payment error:', payErr.message);
+  }
+
+  return { paymentTriggered, otpRequired, payData };
+}
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
@@ -577,77 +656,86 @@ export default async function handler(req, res) {
                            msisdn.startsWith('+233') ? '0' + msisdn.slice(4)  :
                            msisdn;
 
-        // Trigger MoMo PIN prompt
-        let paymentTriggered = false;
-        let otpRequired = false;
-        console.log('[USSD] Moolre payment request:', JSON.stringify({
-          channel, currency: 'GHS', payer: payerLocal.slice(0, -4) + '****',
-          amount: total, externalref: ref, accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
-          hasApiKey: !!process.env.MOOLRE_API_KEY,
-        }));
-        try {
-          const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
-            method: 'POST',
-            headers: {
-              // NOTE: the Initiate Payment endpoint requires the PRIVATE key
-              // (X-API-KEY), not the public key. Using X-API-PUBKEY here makes
-              // Moolre reject the request, so the MoMo prompt never goes out —
-              // this was the bug causing "no prompt" on USSD.
-              'X-API-USER':   process.env.MOOLRE_USERNAME,
-              'X-API-KEY':    process.env.MOOLRE_API_KEY,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              type:          1,
-              channel,
-              currency:      'GHS',
-              payer:         payerLocal,
-              amount:        total, // Moolre docs: amount must be a string, e.g. "30.00"
-              externalref:   ref,
-              reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
-              sessionid:     sessionId,
-              accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
-            }),
+        const { paymentTriggered, otpRequired } = await triggerMoolrePayment({
+          channel, payerLocal, total, ref, quantity, voucherType, sessionId,
+        });
+
+        if (otpRequired) {
+          // Moolre wants OTP verification before it will send the prompt.
+          // Move to AWAIT_OTP and keep this same externalref — the
+          // resubmission in that stage must reuse it (Moolre docs: otpcode
+          // is a parameter on this SAME endpoint/reference, not a new call).
+          await setSession(sessionId, {
+            stage: 'AWAIT_OTP', voucherType, quantity, pendingRef: ref,
           });
-          const payData = await payRes.json();
-          console.log('[USSD] Moolre payment response:', JSON.stringify(payData));
-
-          // Per https://docs.moolre.com/ai/initiate-payment.html, Moolre's
-          // Initiate Payment endpoint returns status:1 for TWO different
-          // outcomes, and only one of them actually sends a prompt:
-          //   code "TR099" -> request accepted, the MoMo prompt was sent
-          //                   directly to the customer's phone — this is
-          //                   the no-OTP USSD payment flow we want.
-          //   code "TP14"  -> Moolre wants OTP verification first; NO
-          //                   prompt is sent. This USSD menu has no step
-          //                   to collect an OTP, so this response must be
-          //                   treated as "nothing happened" — checking only
-          //                   status===1 was the bug: it made this branch
-          //                   look like a success and told the customer a
-          //                   prompt was on its way when none ever went out.
-          const payCode = String(payData?.code || '');
-          otpRequired = payCode === 'TP14';
-          paymentTriggered = Number(payData?.status) === 1 && payCode === 'TR099';
-
-          if (otpRequired) {
-            console.error(`[USSD] Moolre requires OTP verification for ${ref} (msisdn=${msisdn}) — no prompt was sent. This flow doesn't collect OTPs; check the OTP/mandate setting on the Moolre account dashboard.`);
-          } else if (!paymentTriggered) {
-            console.error(`[USSD] Moolre payment NOT accepted for ${ref}: status=${payData?.status} code=${payData?.code} message="${payData?.message}"`);
-          }
-        } catch (payErr) {
-          console.error('[USSD] Moolre payment error:', payErr.message);
+          return respond(
+            `Enter the verification code (OTP) sent to ${msisdn} to continue your GHS ${total} payment:`,
+            true
+          );
         }
 
         if (!paymentTriggered) {
-          const alertMsg = otpRequired
-            ? `⚠️ USSD payment for ${ref} (${quantity}x ${voucherType}, ${msisdn}) needs OTP verification — Moolre did NOT send the MoMo prompt. This USSD flow can't collect an OTP; check the OTP/mandate setting for this account on the Moolre dashboard.`
-            : `⚠️ USSD payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Customer saw an error.`;
-          await sendAdminAlert(alertMsg);
+          await sendAdminAlert(
+            `⚠️ USSD payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Customer saw an error.`
+          );
           return respond('Unable to start payment right now. Please try again shortly.', false);
         }
 
         // Poll for payment status as fallback — Moolre may not fire a webhook
         // for USSD-triggered payments. Poll every 5s for up to 60s.
+        pollAndFulfill({ ref, phone: msisdn, voucherType, quantity, total });
+
+        return respond(
+          `Please authorize the GHS ${total} MoMo payment prompt on your phone.\nVouchers will be sent via SMS after payment.`,
+          false
+        );
+      }
+
+      // ── OTP verification (Moolre returned TP14 on the initial attempt) ────
+      // Customer enters the code Moolre sent them; we resubmit the SAME
+      // externalref with otpcode set, per Moolre's documented retry contract.
+      case 'AWAIT_OTP': {
+        if (choice === '0') return respond('Cancelled. Goodbye!', false);
+
+        const otpcode = choice.replace(/\s+/g, '');
+        if (!/^\d{3,8}$/.test(otpcode)) {
+          return respond('Enter the numeric OTP you received, or 0 to cancel:', true);
+        }
+
+        const voucherType = session.voucherType ? String(session.voucherType) : null;
+        const quantity    = session.quantity ? parseInt(session.quantity, 10) : 0;
+        const ref         = session.pendingRef;
+        const unitPrice   = parseFloat(prices[voucherType] || 0);
+        const total       = (unitPrice * quantity).toFixed(2);
+
+        if (!voucherType || !quantity || !ref) {
+          console.error('[USSD] AWAIT_OTP: missing session data', JSON.stringify(session));
+          return respond('Session expired. Please dial again.', false);
+        }
+
+        const networkToChannel = { 3: '13', 5: '7', 6: '6' };
+        const channel = networkToChannel[network] || '13';
+        const payerLocal = msisdn.startsWith('233')  ? '0' + msisdn.slice(3)  :
+                           msisdn.startsWith('+233') ? '0' + msisdn.slice(4)  :
+                           msisdn;
+
+        const { paymentTriggered, otpRequired } = await triggerMoolrePayment({
+          channel, payerLocal, total, ref, quantity, voucherType, sessionId, otpcode,
+        });
+
+        if (otpRequired) {
+          // Moolre rejected this code (or wants another round) — let the
+          // customer try again rather than dead-ending the sale.
+          return respond('Incorrect or expired code. Enter the OTP again, or 0 to cancel:', true);
+        }
+
+        if (!paymentTriggered) {
+          await sendAdminAlert(
+            `⚠️ USSD OTP payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Customer saw an error.`
+          );
+          return respond('Unable to complete payment right now. Please try again shortly.', false);
+        }
+
         pollAndFulfill({ ref, phone: msisdn, voucherType, quantity, total });
 
         return respond(
