@@ -14,7 +14,8 @@
 // RESPONSE: { message: string, reply: boolean }
 
 import pool from '../../lib/db';
-import { getPrices, getSetting } from '../../lib/settings';
+import { initHubtelDirectDebit } from '../../lib/hubtel';
+import { getPrices } from '../../lib/settings';
 import { sendAdminAlert } from '../../lib/alerts';
 import { sendVoucherSMS, sendPreorderSMS } from '../../lib/sms';
 
@@ -54,19 +55,13 @@ async function ensureTable() {
       updated_at   TIMESTAMP DEFAULT NOW()
     )
   `);
-  // pending_ref carries the externalref of a payment awaiting OTP (TP14)
-  // so the OTP can be resubmitted against the SAME reference, per Moolre's
-  // documented retry contract (otpcode param on /open/transact/payment).
-  await pool.query(`
-    ALTER TABLE ussd_sessions ADD COLUMN IF NOT EXISTS pending_ref VARCHAR(100)
-  `);
 }
 
 async function getSession(sessionId) {
   try {
     await ensureTable();
     const r = await pool.query(
-      'SELECT stage, voucher_type, quantity, pending_ref FROM ussd_sessions WHERE session_id = $1',
+      'SELECT stage, voucher_type, quantity FROM ussd_sessions WHERE session_id = $1',
       [String(sessionId)]
     );
     if (r.rows.length === 0) return null;
@@ -75,7 +70,6 @@ async function getSession(sessionId) {
       stage:       row.stage || 'MENU',
       voucherType: row.voucher_type || null,
       quantity:    row.quantity != null ? parseInt(row.quantity, 10) : null,
-      pendingRef:  row.pending_ref || null,
     };
   } catch (err) {
     console.error('[USSD] getSession error:', err.message);
@@ -87,16 +81,15 @@ async function setSession(sessionId, data) {
   try {
     await ensureTable();
     await pool.query(
-      `INSERT INTO ussd_sessions (session_id, stage, voucher_type, quantity, pending_ref, updated_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
+      `INSERT INTO ussd_sessions (session_id, stage, voucher_type, quantity, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
        ON CONFLICT (session_id) DO UPDATE
-       SET stage=$2, voucher_type=$3, quantity=$4, pending_ref=$5, updated_at=NOW()`,
+       SET stage=$2, voucher_type=$3, quantity=$4, updated_at=NOW()`,
       [
         String(sessionId),
         String(data.stage),
         data.voucherType != null ? String(data.voucherType) : null,
         data.quantity    != null ? parseInt(data.quantity, 10) : null,
-        data.pendingRef  != null ? String(data.pendingRef)   : null,
       ]
     );
   } catch (err) {
@@ -371,23 +364,10 @@ async function pollAndFulfill({ ref, phone, voucherType, quantity, total }) {
         );
 
         if (vouchers.rowCount < quantity) {
-          // Payment confirmed but no stock — save preorder so admin can fulfill it
-          await client.query(
-            `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
-             VALUES ($1,$2,'',$3,$4,$5,'pending',NOW())
-             ON CONFLICT (reference) DO NOTHING`,
-            [ref, phone, parseFloat(total), quantity, voucherType]
-          );
-          await client.query(
-            `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-             VALUES ($1,$2,$3,$4,$5,'preorder',NOW())
-             ON CONFLICT (reference) DO UPDATE SET status='preorder'`,
-            [ref, phone, parseFloat(total), quantity, voucherType]
-          );
           await client.query('COMMIT');
           client.release();
           await sendPreorderSMS(phone, voucherType, ref);
-          await sendAdminAlert(`⚠️ USSD Preorder: ${voucherType} x${quantity} from ${phone}. Ref: ${ref}`);
+          await sendAdminAlert(`OUT OF STOCK (poll): ${voucherType} x${quantity} from ${phone}. Ref: ${ref}`);
           return;
         }
 
@@ -421,77 +401,6 @@ async function pollAndFulfill({ ref, phone, voucherType, quantity, total }) {
   }
 
   console.warn('[USSD] Poll timed out for', ref);
-}
-
-// ── Trigger / resubmit a Moolre USSD payment ──────────────────────────────────
-// Shared by the initial CONFIRM step and the AWAIT_OTP resubmission step.
-// Per https://docs.moolre.com/ai/initiate-payment.html, this endpoint returns
-// status:1 for TWO different outcomes:
-//   code "TR099" -> request accepted, the MoMo prompt was sent directly to
-//                   the customer's phone.
-//   code "TP14"  -> Moolre wants OTP verification first; NO prompt is sent
-//                   on this call. The documented way to complete the payment
-//                   is to resubmit this SAME call with otpcode set, once the
-//                   customer has the code (sent by Moolre via SMS).
-// There is no documented account/request flag that suppresses TP14 outright;
-// only this collect-and-resubmit flow is documented, so that's what we
-// implement. otpcode is omitted entirely on the first attempt (Moolre docs
-// list it as optional) and only included on resubmission.
-async function triggerMoolrePayment({ channel, payerLocal, total, ref, quantity, voucherType, sessionId, otpcode }) {
-  const payload = {
-    type:          1,
-    channel,
-    currency:      'GHS',
-    payer:         payerLocal,
-    amount:        total, // Moolre docs: amount must be a string, e.g. "30.00"
-    externalref:   ref,
-    reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
-    sessionid:     sessionId,
-    accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
-  };
-  if (otpcode) payload.otpcode = otpcode;
-
-  console.log('[USSD] Moolre payment request:', JSON.stringify({
-    ...payload,
-    payer: payerLocal.slice(0, -4) + '****',
-    otpcode: otpcode ? '***' : undefined,
-  }));
-
-  let paymentTriggered = false;
-  let otpRequired = false;
-  let payData = null;
-
-  try {
-    const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
-      method: 'POST',
-      headers: {
-        // NOTE: the Initiate Payment endpoint requires the PRIVATE key
-        // (X-API-KEY), not the public key. Using X-API-PUBKEY here makes
-        // Moolre reject the request, so the MoMo prompt never goes out —
-        // this was the bug causing "no prompt" on USSD.
-        'X-API-USER':   process.env.MOOLRE_USERNAME,
-        'X-API-KEY':    process.env.MOOLRE_API_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
-    payData = await payRes.json();
-    console.log('[USSD] Moolre payment response:', JSON.stringify(payData));
-
-    const payCode = String(payData?.code || '');
-    otpRequired = payCode === 'TP14';
-    paymentTriggered = Number(payData?.status) === 1 && payCode === 'TR099';
-
-    if (otpRequired) {
-      console.error(`[USSD] Moolre requires OTP verification for ${ref} (otpcode ${otpcode ? 'was' : 'was NOT'} supplied on this attempt).`);
-    } else if (!paymentTriggered) {
-      console.error(`[USSD] Moolre payment NOT accepted for ${ref}: status=${payData?.status} code=${payData?.code} message="${payData?.message}"`);
-    }
-  } catch (payErr) {
-    console.error('[USSD] Moolre payment error:', payErr.message);
-  }
-
-  return { paymentTriggered, otpRequired, payData };
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
@@ -566,9 +475,6 @@ export default async function handler(req, res) {
         `Welcome to WAEC GH Checkers\n` +
         `1. WASSCE (GHS ${prices.WASSCE})\n` +
         `2. BECE (GHS ${prices.BECE})\n` +
-        `3. Retrieve Voucher\n` +
-        `4. BECE Release Date\n` +
-        `5. WASSCE Release Date\n` +
         `0. Exit`,
         true
       );
@@ -584,21 +490,9 @@ export default async function handler(req, res) {
       case 'MENU': {
         const typeMap = { '1': 'WASSCE', '2': 'BECE' };
         if (choice === '0') return respond('Thank you. Goodbye!', false);
-        if (choice === '3') {
-          await setSession(sessionId, { stage: 'RETRIEVE_PHONE' });
-          return respond('Enter phone number used for purchase\n(or press 0 to go back):', true);
-        }
-        if (choice === '4') {
-          const msg = await getSetting('bece_release_message', 'BECE release date has not been announced yet. Check back soon.');
-          return respond(msg, false);
-        }
-        if (choice === '5') {
-          const msg = await getSetting('wassce_release_message', 'WASSCE release date has not been announced yet. Check back soon.');
-          return respond(msg, false);
-        }
         if (!typeMap[choice]) {
           return respond(
-            `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. Retrieve Voucher\n4. BECE Release Date\n5. WASSCE Release Date\n0. Exit`,
+            `Choose an option:\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n0. Exit`,
             true
           );
         }
@@ -641,10 +535,61 @@ export default async function handler(req, res) {
         const safeSuffix = String(sessionId).replace(/\W/g, '').slice(-6).toUpperCase() || 'USSD';
         const ref = `USSD-${Date.now()}-${safeSuffix}`;
 
-        // ── Do NOT reserve vouchers or create a preorder here ─────────────
-        // Payment has not happened yet — the customer still needs to approve
-        // the MoMo prompt. Vouchers are assigned (or a preorder created) only
-        // after payment is confirmed inside pollAndFulfill / handlePaymentWebhook.
+        // Reserve vouchers (or create preorder) before triggering payment
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+
+          const available = await client.query(
+            `SELECT id, serial, pin FROM vouchers
+             WHERE type=$1 AND status='available'
+             ORDER BY id ASC LIMIT $2
+             FOR UPDATE SKIP LOCKED`,
+            [voucherType, quantity]
+          );
+
+          if (available.rows.length >= quantity) {
+            // Reserve vouchers — mark as sold with this ref
+            // Webhook will send SMS after payment confirmed
+            const ids = available.rows.map(v => v.id);
+            await client.query(
+              `UPDATE vouchers SET status='sold', sold_to=$1, transaction_ref=$2, sold_at=NOW()
+               WHERE id=ANY($3)`,
+              [msisdn, ref, ids]
+            );
+            await client.query(
+              `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
+               VALUES ($1,$2,$3,$4,$5,'pending',NOW())
+               ON CONFLICT (reference) DO NOTHING`,
+              [ref, msisdn, parseFloat(total), quantity, voucherType]
+            );
+          } else {
+            // Out of stock — save preorder, webhook will handle when stock is added
+            await client.query(
+              `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
+               VALUES ($1,$2,'',$3,$4,$5,'pending',NOW())
+               ON CONFLICT (reference) DO NOTHING`,
+              [ref, msisdn, parseFloat(total), quantity, voucherType]
+            );
+            await client.query(
+              `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
+               VALUES ($1,$2,$3,$4,$5,'preorder',NOW())
+               ON CONFLICT (reference) DO NOTHING`,
+              [ref, msisdn, parseFloat(total), quantity, voucherType]
+            );
+            await sendAdminAlert(
+              `⚠️ USSD Preorder: ${voucherType} x${quantity} GHS ${total} from ${msisdn}. Ref: ${ref}`
+            );
+          }
+
+          await client.query('COMMIT');
+          client.release();
+        } catch (dbErr) {
+          await client.query('ROLLBACK');
+          client.release();
+          console.error('[USSD] CONFIRM DB error:', dbErr.message);
+          return respond('An error occurred. Please try again.', false);
+        }
 
         // Map USSD network to Moolre payment channel
         // USSD: 3=MTN, 5=AT, 6=Telecel → Payment: 13=MTN, 7=AT, 6=Telecel
@@ -656,28 +601,93 @@ export default async function handler(req, res) {
                            msisdn.startsWith('+233') ? '0' + msisdn.slice(4)  :
                            msisdn;
 
-        const { paymentTriggered, otpRequired } = await triggerMoolrePayment({
-          channel, payerLocal, total, ref, quantity, voucherType, sessionId,
-        });
+        // Trigger MoMo PIN prompt via Hubtel (primary) with Moolre fallback
+        // Map USSD network to Hubtel/Moolre channel names
+        const networkNameMap = { 3: 'MTN', 5: 'AT', 6: 'TELECEL' };
+        const networkName = networkNameMap[network] || 'MTN';
 
-        if (otpRequired) {
-          // Moolre wants OTP verification before it will send the prompt.
-          // Move to AWAIT_OTP and keep this same externalref — the
-          // resubmission in that stage must reuse it (Moolre docs: otpcode
-          // is a parameter on this SAME endpoint/reference, not a new call).
-          await setSession(sessionId, {
-            stage: 'AWAIT_OTP', voucherType, quantity, pendingRef: ref,
+        let paymentTriggered = false;
+        let moolreFailureCode = null;
+
+        // ── Hubtel direct debit (primary) ─────────────────────────────────
+        try {
+          await initHubtelDirectDebit({
+            phone:       payerLocal,
+            amount:      parseFloat(total),
+            reference:   ref,
+            description: `${quantity}x ${voucherType} - WAEC GH Checkers`,
+            network:     networkName,
           });
-          return respond(
-            `Enter the verification code (OTP) sent to ${msisdn} to continue your GHS ${total} payment:`,
-            true
-          );
+          console.log('[USSD] Hubtel direct debit triggered for', ref);
+          paymentTriggered = true;
+        } catch (hubtelErr) {
+          console.error('[USSD] Hubtel direct debit failed, trying Moolre:', hubtelErr.message);
+        }
+
+        // ── Moolre fallback ───────────────────────────────────────────────
+        if (!paymentTriggered) {
+          try {
+            const networkToChannel = { 3: '13', 5: '7', 6: '6' };
+            const channel = networkToChannel[network] || '13';
+            const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
+              method: 'POST',
+              headers: {
+                // Initiate Payment requires the PRIVATE key (X-API-KEY) per
+                // Moolre's docs — X-API-PUBKEY here gets the request rejected
+                // and no prompt is ever sent.
+                'X-API-USER':   process.env.MOOLRE_USERNAME,
+                'X-API-KEY':    process.env.MOOLRE_API_KEY,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                type:          1,
+                channel,
+                currency:      'GHS',
+                payer:         payerLocal,
+                amount:        total, // Moolre docs: amount must be a string, e.g. "30.00"
+                externalref:   ref,
+                reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
+                sessionid:     sessionId,
+                accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+              }),
+            });
+            const payData = await payRes.json();
+            console.log('[USSD] Moolre fallback response:', JSON.stringify(payData));
+
+            // status===1 covers TWO different outcomes, so it alone can't
+            // tell us a prompt went out:
+            //   code "TR099" -> the OTP-free USSD MoMo prompt was SENT.
+            //   code "TP14"  -> OTP verification required instead; NO prompt
+            //                    was sent. This flow doesn't support OTP, so
+            //                    TP14 is treated as a failure, not a success.
+            const moolreCode = payData?.code;
+            paymentTriggered = Number(payData?.status) === 1 && moolreCode === 'TR099';
+
+            if (!paymentTriggered) {
+              if (Number(payData?.status) === 1 && moolreCode === 'TP14') {
+                moolreFailureCode = 'TP14 (OTP required)';
+                console.error(`[USSD] Moolre requires OTP verification for ${ref} — no prompt was sent. This USSD flow only supports the no-OTP path.`);
+              } else {
+                moolreFailureCode = moolreCode || `status ${payData?.status}`;
+                console.error(`[USSD] Moolre payment NOT accepted for ${ref}: status=${payData?.status} code=${moolreCode} message="${payData?.message}"`);
+              }
+            }
+          } catch (moolreErr) {
+            console.error('[USSD] Moolre fallback also failed:', moolreErr.message);
+            moolreFailureCode = 'network/parse error';
+          }
         }
 
         if (!paymentTriggered) {
-          await sendAdminAlert(
-            `⚠️ USSD payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Customer saw an error.`
+          // Neither Hubtel nor Moolre actually sent a prompt — release the
+          // vouchers reserved above so they're not stuck/lost from stock.
+          await pool.query(
+            `UPDATE vouchers SET status='available', sold_to=NULL, transaction_ref=NULL, sold_at=NULL
+             WHERE transaction_ref=$1 AND status='sold'`,
+            [ref]
           );
+          await pool.query(`UPDATE transactions SET status='failed' WHERE reference=$1`, [ref]);
+          await sendAdminAlert(`⚠️ USSD payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Moolre code: ${moolreFailureCode}. Customer saw an error.`);
           return respond('Unable to start payment right now. Please try again shortly.', false);
         }
 
@@ -691,95 +701,10 @@ export default async function handler(req, res) {
         );
       }
 
-      // ── OTP verification (Moolre returned TP14 on the initial attempt) ────
-      // Customer enters the code Moolre sent them; we resubmit the SAME
-      // externalref with otpcode set, per Moolre's documented retry contract.
-      case 'AWAIT_OTP': {
-        if (choice === '0') return respond('Cancelled. Goodbye!', false);
-
-        const otpcode = choice.replace(/\s+/g, '');
-        if (!/^\d{3,8}$/.test(otpcode)) {
-          return respond('Enter the numeric OTP you received, or 0 to cancel:', true);
-        }
-
-        const voucherType = session.voucherType ? String(session.voucherType) : null;
-        const quantity    = session.quantity ? parseInt(session.quantity, 10) : 0;
-        const ref         = session.pendingRef;
-        const unitPrice   = parseFloat(prices[voucherType] || 0);
-        const total       = (unitPrice * quantity).toFixed(2);
-
-        if (!voucherType || !quantity || !ref) {
-          console.error('[USSD] AWAIT_OTP: missing session data', JSON.stringify(session));
-          return respond('Session expired. Please dial again.', false);
-        }
-
-        const networkToChannel = { 3: '13', 5: '7', 6: '6' };
-        const channel = networkToChannel[network] || '13';
-        const payerLocal = msisdn.startsWith('233')  ? '0' + msisdn.slice(3)  :
-                           msisdn.startsWith('+233') ? '0' + msisdn.slice(4)  :
-                           msisdn;
-
-        const { paymentTriggered, otpRequired } = await triggerMoolrePayment({
-          channel, payerLocal, total, ref, quantity, voucherType, sessionId, otpcode,
-        });
-
-        if (otpRequired) {
-          // Moolre rejected this code (or wants another round) — let the
-          // customer try again rather than dead-ending the sale.
-          return respond('Incorrect or expired code. Enter the OTP again, or 0 to cancel:', true);
-        }
-
-        if (!paymentTriggered) {
-          await sendAdminAlert(
-            `⚠️ USSD OTP payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Customer saw an error.`
-          );
-          return respond('Unable to complete payment right now. Please try again shortly.', false);
-        }
-
-        pollAndFulfill({ ref, phone: msisdn, voucherType, quantity, total });
-
-        return respond(
-          `Please authorize the GHS ${total} MoMo payment prompt on your phone.\nVouchers will be sent via SMS after payment.`,
-          false
-        );
-      }
-
-      // ── Retrieve voucher — phone entry ────────────────────────────────────
-      case 'RETRIEVE_PHONE': {
-        if (choice === '0') {
-          await setSession(sessionId, { stage: 'MENU' });
-          return respond(
-            `WAEC GH Checkers\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. Retrieve Voucher\n4. BECE Release Date\n5. WASSCE Release Date\n0. Exit`,
-            true
-          );
-        }
-        // Normalise the phone number to 233XXXXXXXXX
-        let lookupPhone = choice.replace(/\s/g, '');
-        if (lookupPhone.startsWith('+')) lookupPhone = lookupPhone.slice(1);
-        if (lookupPhone.startsWith('0')) lookupPhone = '233' + lookupPhone.slice(1);
-
-        try {
-          const result = await pool.query(
-            `SELECT serial, pin, type FROM vouchers
-             WHERE sold_to = $1 AND status = 'sold'
-             ORDER BY sold_at DESC LIMIT 5`,
-            [lookupPhone]
-          );
-          if (result.rowCount === 0) {
-            return respond('No vouchers found for that number. Please check the number and try again.', false);
-          }
-          const lines = result.rows.map(v => `${v.type}: SN ${v.serial} PIN ${v.pin}`);
-          return respond(`Your vouchers:\n${lines.join('\n')}`, false);
-        } catch (dbErr) {
-          console.error('[USSD] RETRIEVE_PHONE DB error:', dbErr.message);
-          return respond('Error looking up vouchers. Please try again.', false);
-        }
-      }
-
       default:
         await setSession(sessionId, { stage: 'MENU' });
         return respond(
-          `WAEC GH Checkers\n1. WASSCE (GHS ${prices.WASSCE})\n2. BECE (GHS ${prices.BECE})\n3. Retrieve Voucher\n4. BECE Release Date\n5. WASSCE Release Date\n0. Exit`,
+          `WAEC GH Checkers\n1. WASSCE\n2. BECE\n0. Exit`,
           true
         );
     }
