@@ -579,6 +579,7 @@ export default async function handler(req, res) {
 
         // Trigger MoMo PIN prompt
         let paymentTriggered = false;
+        let otpRequired = false;
         console.log('[USSD] Moolre payment request:', JSON.stringify({
           channel, currency: 'GHS', payer: payerLocal.slice(0, -4) + '****',
           amount: total, externalref: ref, accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
@@ -610,10 +611,27 @@ export default async function handler(req, res) {
           });
           const payData = await payRes.json();
           console.log('[USSD] Moolre payment response:', JSON.stringify(payData));
-          // status === 1 means Moolre accepted the request and sent the
-          // prompt. Anything else (e.g. auth failure) means nothing was sent.
-          paymentTriggered = Number(payData?.status) === 1;
-          if (!paymentTriggered) {
+
+          // Per https://docs.moolre.com/ai/initiate-payment.html, Moolre's
+          // Initiate Payment endpoint returns status:1 for TWO different
+          // outcomes, and only one of them actually sends a prompt:
+          //   code "TR099" -> request accepted, the MoMo prompt was sent
+          //                   directly to the customer's phone — this is
+          //                   the no-OTP USSD payment flow we want.
+          //   code "TP14"  -> Moolre wants OTP verification first; NO
+          //                   prompt is sent. This USSD menu has no step
+          //                   to collect an OTP, so this response must be
+          //                   treated as "nothing happened" — checking only
+          //                   status===1 was the bug: it made this branch
+          //                   look like a success and told the customer a
+          //                   prompt was on its way when none ever went out.
+          const payCode = String(payData?.code || '');
+          otpRequired = payCode === 'TP14';
+          paymentTriggered = Number(payData?.status) === 1 && payCode === 'TR099';
+
+          if (otpRequired) {
+            console.error(`[USSD] Moolre requires OTP verification for ${ref} (msisdn=${msisdn}) — no prompt was sent. This flow doesn't collect OTPs; check the OTP/mandate setting on the Moolre account dashboard.`);
+          } else if (!paymentTriggered) {
             console.error(`[USSD] Moolre payment NOT accepted for ${ref}: status=${payData?.status} code=${payData?.code} message="${payData?.message}"`);
           }
         } catch (payErr) {
@@ -621,7 +639,10 @@ export default async function handler(req, res) {
         }
 
         if (!paymentTriggered) {
-          await sendAdminAlert(`⚠️ USSD payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Customer saw an error.`);
+          const alertMsg = otpRequired
+            ? `⚠️ USSD payment for ${ref} (${quantity}x ${voucherType}, ${msisdn}) needs OTP verification — Moolre did NOT send the MoMo prompt. This USSD flow can't collect an OTP; check the OTP/mandate setting for this account on the Moolre dashboard.`
+            : `⚠️ USSD payment trigger FAILED for ${ref} (${quantity}x ${voucherType}, ${msisdn}). Customer saw an error.`;
+          await sendAdminAlert(alertMsg);
           return respond('Unable to start payment right now. Please try again shortly.', false);
         }
 
