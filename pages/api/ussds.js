@@ -1,15 +1,36 @@
-// POST /api/ussd — Moolre USSD callback handler with DB-backed sessions
+// POST /api/ussd — Moolre USSD menu handler, now paying out via Npontu Pay
 //
-// Moolre uses ONE callback URL per account — so payment webhooks also
-// arrive here. We detect them by checking for body.data.txstatus and
-// route them to the webhook fulfillment logic.
+// The USSD menu itself is still driven by Moolre's USSD callback (the
+// sessionId/msisdn/network/message fields below are Moolre's). What has
+// changed is WHO we ask to actually move money once the customer confirms:
+// that now goes to Npontu Pay (https://pay.npontu.com) instead of Moolre's
+// payment API.
 //
-// MOOLRE USSD FIELDS:
+// Npontu Pay also delivers payment confirmations via webhook to whatever
+// `callback_url` we send on the initiate-payment call — and we point that
+// at THIS SAME endpoint, so payment webhooks arrive here too, alongside
+// USSD menu traffic. We detect them defensively (see the webhook-detection
+// check in the main handler, and parseNpontuWebhook below) since Npontu's
+// public docs at the time of writing only document the initiate-payment
+// request, not the exact webhook body shape — we accept several plausible
+// field names rather than guessing a single rigid shape.
+//
+// MOOLRE USSD FIELDS (menu flow only — payment is now Npontu):
 //   sessionId  — unique session ID
 //   new        — true/1/"true"/"1" on first request
 //   msisdn     — customer phone e.g. "233241235993"
 //   network    — 3=MTN, 5=AT, 6=Telecel
 //   message    — accumulated input e.g. "1*2*1"
+//
+// NPONTU PAY — POST https://pay.npontu.com/api/v1/pay
+//   Auth: HTTP Basic, username=NPONTU_UID, password=NPONTU_PASS
+//   Body: { transaction_id, network: 'mtn'|'telecel'|'tigo', amount,
+//           phone_number: '233XXXXXXXXX', reference, callback_url }
+//   NOTE: Npontu's documented network values are lowercase 'mtn', 'telecel',
+//   'tigo' — there is no separate AirtelTigo/AT split like Moolre's channel
+//   codes had, so both AT and Telecel USSD traffic must map sensibly here.
+//   (Network code 5 in Moolre's USSD payload is "AT" / AirtelTigo — mapped
+//   to Npontu's 'tigo' below since that's the literal token their docs use.)
 //
 // RESPONSE: { message: string, reply: boolean }
 
@@ -105,81 +126,208 @@ async function clearSession(sessionId) {
 }
 
 // ── Payment webhook fulfillment ───────────────────────────────────────────────
-// Called when Moolre POSTs a payment confirmation to this URL.
+// Called when Npontu Pay POSTs a payment confirmation to our callback_url.
+//
+// Npontu's published docs (https://pay.npontu.com/documentation) document the
+// *request* to POST /api/v1/pay in detail, but do NOT document the exact JSON
+// body of the webhook callback they send to `callback_url`. To avoid silently
+// failing to detect a real webhook because of a guessed field name, this
+// parser checks several plausible variants for each value rather than
+// assuming one fixed shape. The full raw payload is always logged so the
+// actual shape can be confirmed from production logs and this parser
+// tightened later if needed.
+
+function parseNpontuWebhook(payload) {
+  // Some gateways nest the transaction under "data" or "transaction";
+  // others send it flat at the top level. Check both.
+  const txData = payload?.data || payload?.transaction || payload;
+
+  // IMPORTANT: we deliberately do NOT collapse these into one value with
+  // "??". transaction_id is what WE send Npontu on the initiate-payment
+  // call (our own `ref`, e.g. "USSD-..."), so it should always be the
+  // primary key to look up. But some payloads may carry a *different*
+  // identifier under "reference"/"order_id"/etc that is actually Npontu's
+  // own internal id rather than ours, or — on the flip side — may omit
+  // transaction_id and only carry the order reference. Collapsing these
+  // into a single value with "??" means whichever field happens to come
+  // first in the chain wins, and if that's the wrong one for a given
+  // payload shape, the order lookup silently fails even though it really
+  // is one of ours. So we keep every distinct candidate value and let the
+  // caller try each one against the DB in turn.
+  const refCandidates = [
+    txData.transaction_id,
+    txData.transactionId,
+    txData.reference,
+    txData.order_id,
+    txData.orderId,
+    txData.externalref,
+    txData.external_reference,
+    txData.txn_id,
+  ]
+    .filter((v) => v != null && String(v).trim() !== '')
+    .map((v) => String(v).trim());
+
+  // De-duplicate while preserving order (e.g. when transaction_id and
+  // reference happen to carry the same value).
+  const references = [...new Set(refCandidates)];
+
+  const rawStatus =
+    txData.status ?? txData.payment_status ?? txData.transaction_status ??
+    txData.txstatus ?? '';
+
+  const payer =
+    txData.phone_number ?? txData.phoneNumber ?? txData.payer ??
+    txData.msisdn ?? '';
+
+  const amount = txData.amount ?? 0;
+
+  // Seen in production: Npontu includes a pipe-delimited diagnostic string
+  // here on failures, e.g. "TARGET_AUTHORIZATION_ERROR|<detail>". Captured
+  // purely for logging — not used in any control-flow decision.
+  const responseMessage = txData.responseMessage ?? txData.ourDesc ?? '';
+
+  // Normalise status to one of: success | failed | pending | unknown
+  const statusStr = String(rawStatus).trim().toUpperCase();
+  let status = 'unknown';
+  if (statusStr === 'SUCCESS' || statusStr === '1' || statusStr === 'COMPLETED' || statusStr === 'SUCCESSFUL') {
+    status = 'success';
+  } else if (statusStr === 'FAILED' || statusStr === 'CANCELLED' || statusStr === 'CANCELED' || statusStr === '2') {
+    status = 'failed';
+  } else if (statusStr === 'PENDING' || statusStr === '0' || statusStr === '') {
+    status = 'pending';
+  }
+
+  // `reference` is kept for logging/back-compat — first candidate found,
+  // same as before — but control flow below uses `references` (plural)
+  // to try every candidate against the DB rather than trusting one guess.
+  return { reference: references[0] ?? null, references, status, payer: String(payer || ''), amount, responseMessage };
+}
+
+// Look up an order by trying each candidate identifier in turn, checking
+// preorders first then transactions (matching the original single-reference
+// lookup order). Returns the matched reference (the one actually found in
+// OUR database) plus the order row, or null if none of the candidates
+// match anything we know about — which legitimately happens for webhooks
+// belonging to other systems/integrations sharing the same Npontu account.
+async function findOrderByAnyReference(references) {
+  for (const candidate of references) {
+    const preorderRow = await pool.query(
+      `SELECT phone, quantity, voucher_type, amount FROM preorders WHERE reference=$1`,
+      [candidate]
+    );
+    if (preorderRow.rowCount > 0) {
+      return { matchedReference: candidate, source: 'preorders', row: preorderRow.rows[0] };
+    }
+
+    const txRow = await pool.query(
+      `SELECT phone, quantity, voucher_type, amount FROM transactions WHERE reference=$1`,
+      [candidate]
+    );
+    if (txRow.rowCount > 0) {
+      return { matchedReference: candidate, source: 'transactions', row: txRow.rows[0] };
+    }
+  }
+  return null;
+}
 
 async function handlePaymentWebhook(res, payload) {
   console.log('[Webhook] Received payload:', JSON.stringify(payload));
 
-  const txData = payload?.data;
-  if (!txData) {
-    console.warn('[Webhook] Empty data field');
-    return res.status(200).json({ received: true });
-  }
+  const { references, status, payer, amount, responseMessage } = parseNpontuWebhook(payload);
+  const logRef = references[0] ?? '(none)';
 
-  const txstatus  = Number(txData.txstatus);
-  const reference = txData.externalref;
-  const payer     = txData.payer || '';
-  const amount    = txData.amount || 0;
-  const secret    = txData.secret;
-
-  if (process.env.MOOLRE_WEBHOOK_SECRET && secret !== process.env.MOOLRE_WEBHOOK_SECRET) {
-    console.warn('[Webhook] Secret mismatch — ignoring');
-    return res.status(200).json({ received: true });
-  }
-
-  if (txstatus !== 1) {
-    console.log('[Webhook] Non-success txstatus:', txstatus);
-    return res.status(200).json({ received: true, note: 'Non-success txstatus' });
-  }
-
-  if (!reference) {
-    console.warn('[Webhook] No externalref in payload');
-    return res.status(200).json({ received: true });
-  }
-
-  // Idempotency — skip if already fulfilled
-  const existing = await pool.query(
-    `SELECT id FROM transactions WHERE reference=$1 AND status='success'`,
-    [reference]
-  );
-  if (existing.rowCount > 0) {
-    console.log('[Webhook] Already processed:', reference);
-    return res.status(200).json({ received: true, note: 'Already processed' });
-  }
-
-  // Load order — check preorders first, then transactions (USSD saves to transactions)
-  let phone, qty, voucherType, orderAmount;
-
-  const preorderRow = await pool.query(
-    `SELECT phone, quantity, voucher_type, amount FROM preorders WHERE reference=$1`,
-    [reference]
-  );
-
-  if (preorderRow.rowCount > 0) {
-    ({ phone, quantity: qty, voucher_type: voucherType, amount: orderAmount } = preorderRow.rows[0]);
-    console.log('[Webhook] Order found in preorders:', { phone, qty, voucherType });
-  } else {
-    const txRow = await pool.query(
-      `SELECT phone, quantity, voucher_type, amount FROM transactions WHERE reference=$1`,
-      [reference]
+  if (status !== 'success') {
+    console.log(
+      `[Webhook] Non-success status (${status}) for ref ${logRef}` +
+      (responseMessage ? ` — ${responseMessage}` : '')
     );
-    if (txRow.rowCount > 0) {
-      ({ phone, quantity: qty, voucher_type: voucherType, amount: orderAmount } = txRow.rows[0]);
-      console.log('[Webhook] Order found in transactions:', { phone, qty, voucherType });
-    } else {
-      phone = payer;
-      qty = 1;
-      voucherType = null;
-      orderAmount = amount;
+
+    // A definitive failure means any vouchers the USSD handler pre-assigned
+    // while waiting for this webhook must be released back to stock, and
+    // the transaction marked failed — otherwise they stay locked forever
+    // even though the customer was never charged. Try every candidate
+    // reference, since whichever one matches OUR transaction_ref is the
+    // one that matters here.
+    if (status === 'failed' && references.length > 0) {
+      try {
+        for (const candidate of references) {
+          await pool.query(
+            `UPDATE vouchers SET status='available', sold_to=NULL, transaction_ref=NULL, sold_at=NULL
+             WHERE transaction_ref=$1 AND status='sold'`,
+            [candidate]
+          );
+          await pool.query(
+            `UPDATE transactions SET status='failed' WHERE reference=$1 AND status NOT IN ('success')`,
+            [candidate]
+          );
+        }
+      } catch (releaseErr) {
+        console.error('[Webhook] Failed to release vouchers for failed payment:', releaseErr.message);
+      }
+    }
+
+    return res.status(200).json({ received: true, note: `Non-success status: ${status}` });
+  }
+
+  if (references.length === 0) {
+    console.warn('[Webhook] Could not determine any transaction reference from payload');
+    return res.status(200).json({ received: true });
+  }
+
+  // Idempotency — skip if already fulfilled under ANY candidate reference
+  for (const candidate of references) {
+    const existing = await pool.query(
+      `SELECT id FROM transactions WHERE reference=$1 AND status='success'`,
+      [candidate]
+    );
+    if (existing.rowCount > 0) {
+      console.log('[Webhook] Already processed:', candidate);
+      return res.status(200).json({ received: true, note: 'Already processed' });
     }
   }
 
+  // Load order — try every candidate reference against preorders, then
+  // transactions, in that order, exactly as the original single-reference
+  // lookup did. `reference` below becomes the one that ACTUALLY matched —
+  // not just whichever field a single guess happened to pick.
+  let reference, phone, qty, voucherType, orderAmount;
+
+  const found = await findOrderByAnyReference(references);
+
+  if (found) {
+    reference = found.matchedReference;
+    ({ phone, quantity: qty, voucher_type: voucherType, amount: orderAmount } = found.row);
+    console.log(`[Webhook] Order found in ${found.source} via ref "${reference}":`, { phone, qty, voucherType });
+  } else {
+    // None of the candidate references match anything in our database.
+    // This is expected (not an error) when the webhook belongs to a
+    // different system/integration sharing the same Npontu Pay account —
+    // raising an admin alert for every such webhook would be noise, not
+    // signal, so we only alert when at least one candidate LOOKS like one
+    // of ours (our "USSD-" prefix) yet still wasn't found — that case is
+    // worth a human looking at.
+    const looksLikeOurs = references.some((r) => r.startsWith('USSD-'));
+    if (looksLikeOurs) {
+      console.error('[Webhook] Reference looks like ours but no matching order found:', references);
+      await sendAdminAlert(
+        `WEBHOOK: Payment received (GHS ${amount}) but order not found! Ref(s): ${references.join(', ')}. Phone: ${payer}. Fulfill manually.`
+      );
+      return res.status(200).json({ received: true, note: 'Order not found — admin alerted' });
+    }
+
+    console.log('[Webhook] No matching order for any candidate reference — likely belongs to another system:', references);
+    return res.status(200).json({ received: true, note: 'No matching order — ignored' });
+  }
+
   if (!voucherType) {
-    console.error('[Webhook] Cannot determine voucherType for ref', reference);
+    // Distinct from "no order found" above — we DID find a matching row,
+    // but its voucher_type column is empty. A genuine data issue worth a
+    // human looking at rather than a missing-order case.
+    console.error('[Webhook] Order found but voucher_type is missing for ref', reference);
     await sendAdminAlert(
-      `WEBHOOK: Payment received (GHS ${amount}) but order not found! Ref: ${reference}. Phone: ${payer}. Fulfill manually.`
+      `WEBHOOK: Payment received (GHS ${amount}) for ref ${reference} but voucher_type is missing on the order record. Phone: ${payer}. Fulfill manually.`
     );
-    return res.status(200).json({ received: true, note: 'Order not found — admin alerted' });
+    return res.status(200).json({ received: true, note: 'Order found but voucher_type missing — admin alerted' });
   }
 
   qty = parseInt(qty);
@@ -272,149 +420,6 @@ async function handlePaymentWebhook(res, payload) {
   }
 }
 
-
-// ── Poll for payment confirmation ─────────────────────────────────────────────
-// Polls Moolre every 5s for up to 60s after a USSD payment is triggered.
-// Fulfills the order directly if payment confirmed — handles the case where
-// Moolre does not fire a webhook for USSD-triggered direct debit payments.
-
-async function pollAndFulfill({ ref, phone, voucherType, quantity, total }) {
-  const maxAttempts = 12; // 12 x 5s = 60s
-  const delay = ms => new Promise(r => setTimeout(r, ms));
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    await delay(5000);
-    try {
-      const statusRes = await fetch('https://api.moolre.com/open/transact/status', {
-        method: 'POST',
-        headers: {
-          'X-API-USER':   process.env.MOOLRE_USERNAME,
-          'X-API-PUBKEY': process.env.NEXT_PUBLIC_MOOLRE_PUBLIC_KEY,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          type:          1,
-          idtype:        1,
-          id:            ref,
-          accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
-        }),
-      });
-      const statusData = await statusRes.json();
-      const txstatus = Number(statusData?.data?.txstatus);
-      console.log(`[USSD] Poll attempt ${attempt} for ${ref}: txstatus=${txstatus}`);
-
-      if (txstatus === 2) {
-        // Payment failed — release pre-assigned vouchers back to available
-        console.log('[USSD] Payment failed — releasing reserved vouchers for', ref);
-        await pool.query(
-          `UPDATE vouchers SET status='available', sold_to=NULL, transaction_ref=NULL, sold_at=NULL
-           WHERE transaction_ref=$1 AND status='sold'`,
-          [ref]
-        );
-        await pool.query(
-          `UPDATE transactions SET status='failed' WHERE reference=$1`,
-          [ref]
-        );
-        return;
-      }
-
-      if (txstatus !== 1) continue; // still pending
-
-      // Payment confirmed — check idempotency first
-      const already = await pool.query(
-        `SELECT id FROM transactions WHERE reference=$1 AND status='success'`,
-        [ref]
-      );
-      if (already.rowCount > 0) {
-        console.log('[USSD] Poll: already fulfilled', ref);
-        return;
-      }
-
-      // Fulfill
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-
-        const preAssigned = await client.query(
-          `SELECT id, serial, pin FROM vouchers WHERE transaction_ref=$1 AND status='sold'`,
-          [ref]
-        );
-
-        if (preAssigned.rowCount >= quantity) {
-          await client.query(
-            `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-             VALUES ($1,$2,$3,$4,$5,'success',NOW())
-             ON CONFLICT (reference) DO UPDATE SET status='success'`,
-            [ref, phone, parseFloat(total), quantity, voucherType]
-          );
-          await client.query('COMMIT');
-          client.release();
-          await sendVoucherSMS(phone, preAssigned.rows, voucherType);
-          console.log('[USSD] Poll fulfilled:', ref);
-          return;
-        }
-
-        // No pre-assigned — grab fresh vouchers
-        const vouchers = await client.query(
-          `SELECT id, serial, pin FROM vouchers
-           WHERE type=$1 AND status='available'
-           LIMIT $2 FOR UPDATE SKIP LOCKED`,
-          [voucherType, quantity]
-        );
-
-        if (vouchers.rowCount < quantity) {
-          // Payment confirmed but no stock — save preorder so admin can fulfill it
-          await client.query(
-            `INSERT INTO preorders (reference, phone, name, amount, quantity, voucher_type, status, created_at)
-             VALUES ($1,$2,'',$3,$4,$5,'pending',NOW())
-             ON CONFLICT (reference) DO NOTHING`,
-            [ref, phone, parseFloat(total), quantity, voucherType]
-          );
-          await client.query(
-            `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-             VALUES ($1,$2,$3,$4,$5,'preorder',NOW())
-             ON CONFLICT (reference) DO UPDATE SET status='preorder'`,
-            [ref, phone, parseFloat(total), quantity, voucherType]
-          );
-          await client.query('COMMIT');
-          client.release();
-          await sendPreorderSMS(phone, voucherType, ref);
-          await sendAdminAlert(`⚠️ USSD Preorder: ${voucherType} x${quantity} from ${phone}. Ref: ${ref}`);
-          return;
-        }
-
-        const ids = vouchers.rows.map(v => v.id);
-        await client.query(
-          `UPDATE vouchers SET status='sold', sold_to=$1, sold_at=NOW(), transaction_ref=$2 WHERE id=ANY($3)`,
-          [phone, ref, ids]
-        );
-        await client.query(
-          `INSERT INTO transactions (reference, phone, amount, quantity, voucher_type, status, created_at)
-           VALUES ($1,$2,$3,$4,$5,'success',NOW())
-           ON CONFLICT (reference) DO UPDATE SET status='success'`,
-          [ref, phone, parseFloat(total), quantity, voucherType]
-        );
-        await client.query('COMMIT');
-        client.release();
-        await sendVoucherSMS(phone, vouchers.rows, voucherType);
-        console.log('[USSD] Poll fulfilled (fresh vouchers):', ref);
-        return;
-
-      } catch (err) {
-        await client.query('ROLLBACK');
-        client.release();
-        console.error('[USSD] Poll fulfill error:', err.message);
-        return;
-      }
-
-    } catch (err) {
-      console.error(`[USSD] Poll attempt ${attempt} error:`, err.message);
-    }
-  }
-
-  console.warn('[USSD] Poll timed out for', ref);
-}
-
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
@@ -431,10 +436,31 @@ export default async function handler(req, res) {
   console.log('[USSD] body:', JSON.stringify(body));
 
   // ── Detect payment webhook ─────────────────────────────────────────────────
-  // Moolre sends payment confirmations to the account callback URL.
-  // If that's this USSD endpoint, payment webhooks arrive here too.
-  if (body.data && body.data.txstatus !== undefined && body.data.externalref) {
-    console.log('[USSD] Detected payment webhook — routing to fulfillment');
+  // Npontu Pay sends payment confirmations to whatever callback_url we passed
+  // on the initiate-payment call — which we point at this same endpoint, so
+  // payment webhooks arrive here too, alongside Moolre USSD menu traffic.
+  //
+  // Moolre's USSD menu hits always carry sessionId + msisdn (see fields
+  // below), so a payload that has a transaction reference + status but is
+  // missing those USSD session fields is treated as a Npontu webhook. This
+  // mirrors the defensive field-name matching in parseNpontuWebhook above —
+  // again because Npontu's public docs don't pin down the exact webhook
+  // body shape.
+  const looksLikeUssdSession =
+    (body.sessionId != null || body.session_id != null || body.SessionId != null) &&
+    (body.msisdn != null || body.phone != null || body.PhoneNumber != null);
+
+  const npontuRefField =
+    body.transaction_id ?? body.transactionId ?? body.reference ??
+    body.order_id ?? body.orderId ??
+    body.data?.transaction_id ?? body.data?.reference ?? null;
+
+  const npontuStatusField =
+    body.status ?? body.payment_status ?? body.transaction_status ??
+    body.data?.status ?? body.data?.payment_status ?? null;
+
+  if (!looksLikeUssdSession && npontuRefField != null && npontuStatusField != null) {
+    console.log('[USSD] Detected Npontu payment webhook — routing to fulfillment');
     return handlePaymentWebhook(res, body);
   }
 
@@ -565,82 +591,95 @@ export default async function handler(req, res) {
         // ── Do NOT reserve vouchers or create a preorder here ─────────────
         // Payment has not happened yet — the customer still needs to approve
         // the MoMo prompt. Vouchers are assigned (or a preorder created) only
-        // after payment is confirmed inside pollAndFulfill / handlePaymentWebhook.
+        // after payment is confirmed inside handlePaymentWebhook, once Npontu
+        // posts its callback.
 
-        // Map USSD network to Moolre payment channel
-        // USSD: 3=MTN, 5=AT, 6=Telecel → Payment: 13=MTN, 7=AT, 6=Telecel
-        const networkToChannel = { 3: '13', 5: '7', 6: '6' };
-        const channel = networkToChannel[network] || '13';
+        // Map Moolre's USSD network code to Npontu Pay's network token.
+        // USSD: 3=MTN, 5=AT, 6=Telecel → Npontu: 'mtn' | 'tigo' | 'telecel'
+        // Npontu's docs only list mtn/telecel/tigo (no separate "AT" token),
+        // so network 5 (AirtelTigo) is mapped to 'tigo' — the literal token
+        // their docs use — rather than guessing an unlisted alternative.
+        const networkToNpontu = { 3: 'mtn', 5: 'tigo', 6: 'telecel' };
+        const npontuNetwork = networkToNpontu[network] || 'mtn';
 
-        // Moolre payment API requires local format: 0XXXXXXXXX
-        const payerLocal = msisdn.startsWith('233')  ? '0' + msisdn.slice(3)  :
-                           msisdn.startsWith('+233') ? '0' + msisdn.slice(4)  :
-                           msisdn;
+        // Npontu Pay requires international format: 233XXXXXXXXX
+        const payerInternational =
+          msisdn.startsWith('+233') ? msisdn.slice(1) :
+          msisdn.startsWith('233')  ? msisdn :
+          msisdn.startsWith('0')    ? '233' + msisdn.slice(1) :
+          msisdn;
 
-        // Trigger MoMo PIN prompt
-        let moolreFailed = false;
+        // Build our own callback URL from the incoming request so this works
+        // correctly across environments (e.g. preview deployments) without
+        // hardcoding a host. Falls back to NPONTU_CALLBACK_URL if the host
+        // header is unavailable for any reason.
+        const reqHost  = req.headers['x-forwarded-host'] || req.headers.host;
+        const reqProto = req.headers['x-forwarded-proto'] || 'https';
+        const callbackUrl = reqHost
+          ? `${reqProto}://${reqHost}/api/ussds`
+          : process.env.NPONTU_CALLBACK_URL;
+
+        // Trigger MoMo PIN prompt via Npontu Pay
+        let npontuFailed = false;
         try {
-          const payRes = await fetch('https://api.moolre.com/open/transact/payment', {
+          const npontuAuth = Buffer.from(
+            `${process.env.NPONTU_UID}:${process.env.NPONTU_PASS}`
+          ).toString('base64');
+
+          const payRes = await fetch('https://pay.npontu.com/api/v1/pay', {
             method: 'POST',
             headers: {
-              // Initiate Payment requires the PRIVATE key under X-API-KEY,
-              // not the public key under X-API-PUBKEY (see Moolre docs:
-              // https://docs.moolre.com/ai/initiate-payment.html). Using
-              // X-API-PUBKEY here caused Moolre to reject the request before
-              // the USSD prompt was ever sent — this was the root cause of
-              // the missing payment prompt.
-              'X-API-USER': process.env.MOOLRE_USERNAME,
-              'X-API-KEY':  process.env.MOOLRE_API_KEY,
+              // Npontu Pay's docs require HTTP Basic Auth on this endpoint:
+              // username = NPONTU_UID, password = NPONTU_PASS.
+              // (https://pay.npontu.com/documentation)
+              'Authorization': `Basic ${npontuAuth}`,
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-              type:          1,
-              channel,
-              currency:      'GHS',
-              payer:         payerLocal,
-              amount:        parseFloat(total),
-              externalref:   ref,
-              reference:     `${quantity}x ${voucherType} - WAEC GH Checkers`,
-              sessionid:     sessionId,
-              accountnumber: process.env.NEXT_PUBLIC_MOOLRE_ACCOUNT_NUMBER,
+              transaction_id: ref,
+              network:        npontuNetwork,
+              amount:         parseFloat(total),
+              phone_number:   payerInternational,
+              reference:      `${quantity}x ${voucherType} - WAEC GH Checkers`,
+              callback_url:   callbackUrl,
             }),
           });
-          const payData = await payRes.json();
-          console.log('[USSD] Moolre payment response:', JSON.stringify(payData));
 
-          // status === 1 with code TR099 (or TP14 for OTP) means the prompt
-          // was actually sent. Anything else (e.g. AIN01 auth error, TP13
-          // duplicate ref) means NO prompt reached the customer's phone.
-          const numStatus = typeof payData?.status === 'string'
-            ? parseInt(payData.status, 10)
-            : payData?.status;
-          if (!payRes.ok || numStatus !== 1) {
-            moolreFailed = true;
+          const payData = await payRes.json().catch(() => ({}));
+          console.log('[USSD] Npontu payment response:', payRes.status, JSON.stringify(payData));
+
+          // Npontu's documented error responses (401/400) include an
+          // "error" field. We treat any non-2xx HTTP status, or a body that
+          // carries an "error" field, as the prompt NOT having been sent —
+          // there is no documented success-body shape to positively match
+          // against, so we fail closed rather than assume success.
+          if (!payRes.ok || payData?.error) {
+            npontuFailed = true;
             console.error(
-              `[USSD] Moolre payment NOT accepted for ${ref} — ` +
-              `httpStatus=${payRes.status} status=${numStatus} ` +
-              `code=${payData?.code} message=${payData?.message}`
+              `[USSD] Npontu payment NOT accepted for ${ref} — ` +
+              `httpStatus=${payRes.status} error=${payData?.error} message=${payData?.message}`
             );
           }
         } catch (payErr) {
-          moolreFailed = true;
-          console.error('[USSD] Moolre payment error:', payErr.message);
+          npontuFailed = true;
+          console.error('[USSD] Npontu payment error:', payErr.message);
         }
 
         // Payment was never triggered — tell the customer instead of ending
         // the session as if it worked. Sending them away under a false
         // "check your phone" message is exactly what was costing conversions
         // to other vendors.
-        if (moolreFailed) {
+        if (npontuFailed) {
           return respond(
             'Sorry, we could not start your payment right now. Please try again shortly or contact support.',
             false
           );
         }
 
-        // Poll for payment status as fallback — Moolre may not fire a webhook
-        // for USSD-triggered payments. Poll every 5s for up to 60s.
-        pollAndFulfill({ ref, phone: msisdn, voucherType, quantity, total });
+        // No polling fallback — Npontu Pay's callback_url webhook
+        // (handlePaymentWebhook, above) is the sole source of payment
+        // confirmation now. Npontu's docs don't expose a status-check
+        // endpoint to poll against.
 
         return respond(
           `Please authorize the GHS ${total} MoMo payment prompt on your phone.\nVouchers will be sent via SMS after payment.`,
